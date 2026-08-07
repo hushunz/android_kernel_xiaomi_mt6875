@@ -61,6 +61,9 @@ static void init_hf_core(struct hf_core *core)
 		atomic64_set(&core->state[i].start_time, S64_MAX);
 	}
 
+	mutex_init(&core->device_lock);
+	INIT_LIST_HEAD(&core->device_list);
+
 	spin_lock_init(&core->client_lock);
 	INIT_LIST_HEAD(&core->client_list);
 
@@ -252,6 +255,31 @@ static void hf_manager_io_interrupt(struct hf_manager *manager,
 	hf_manager_sched_sample(manager, timestamp);
 }
 
+int hf_device_register(struct hf_device *device)
+{
+	struct hf_core *core = &hfcore;
+
+	INIT_LIST_HEAD(&device->list);
+	device->ready = false;
+	mutex_lock(&core->device_lock);
+	list_add(&device->list, &core->device_list);
+	mutex_unlock(&core->device_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(hf_device_register);
+
+void hf_device_unregister(struct hf_device *device)
+{
+	struct hf_core *core = &hfcore;
+
+	mutex_lock(&core->device_lock);
+	list_del(&device->list);
+	mutex_unlock(&core->device_lock);
+	device->ready = false;
+}
+EXPORT_SYMBOL_GPL(hf_device_unregister);
+
 int hf_manager_create(struct hf_device *device)
 {
 	uint8_t sensor_type = 0;
@@ -315,6 +343,10 @@ int hf_manager_create(struct hf_device *device)
 	mutex_lock(&manager->core->manager_lock);
 	list_add(&manager->list, &manager->core->manager_list);
 	mutex_unlock(&manager->core->manager_lock);
+
+	mutex_lock(&manager->core->device_lock);
+	manager->hf_dev->ready = true;
+	mutex_unlock(&manager->core->device_lock);
 
 	return 0;
 out_err:
@@ -1254,6 +1286,25 @@ static long hf_manager_ioctl(struct file *filp,
 		if (copy_to_user(ubuf, &packet, sizeof(packet)))
 			return -EFAULT;
 		break;
+	case HF_MANAGER_REQUEST_READY_STATUS:
+	{
+		struct hf_device *device;
+
+		packet.status = true;
+		mutex_lock(&client->core->device_lock);
+		list_for_each_entry(device, &client->core->device_list, list) {
+			if (!READ_ONCE(device->ready)) {
+				pr_err_ratelimited("Device:%s not ready\n",
+					device->dev_name);
+				packet.status = false;
+				break;
+			}
+		}
+		mutex_unlock(&client->core->device_lock);
+		if (copy_to_user(ubuf, &packet, sizeof(packet)))
+			return -EFAULT;
+		break;
+	}
 	default:
 		pr_err("Unknown command %u\n", cmd);
 		return -EINVAL;

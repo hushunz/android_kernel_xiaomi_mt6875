@@ -1996,19 +1996,17 @@ void mtk_nanohub_power_up_loop(void *data)
 		READ_ONCE(device->scp_sensor_fifo->fifo_size));
 	/* 3. send dram information to scp */
 	mtk_nanohub_send_dram_info_to_hub();
-	/* 4. get device info for mag lib and dynamic list */
-	mtk_nanohub_get_devinfo();
-	/* 5. start timesync */
+	/* 4. start timesync */
 	mtk_nanohub_start_timesync();
-	/* 6. we restore sensor calibration data when scp reboot */
+	/* 5. we restore sensor calibration data when scp reboot */
 	mtk_nanohub_restoring_config();
-	/* 7. we enable sensor which sensor is enable by framework */
+	/* 6. we enable sensor which sensor is enable by framework */
 	mutex_lock(&sensor_state_mtx);
 	for (id = 0; id < ID_SENSOR_MAX; id++)
 		mtk_nanohub_restoring_sensor(id);
 	mutex_unlock(&sensor_state_mtx);
 
-	/* 8. create mamanger last */
+	/* 7. create mamanger last */
 	mtk_nanohub_create_manager();
 }
 
@@ -2755,6 +2753,12 @@ static int mtk_nanohub_create_manager(void)
 	hf_dev->selftest = mtk_nanohub_selftest;
 	hf_dev->rawdata = mtk_nanohub_rawdata;
 	hf_dev->custom_cmd = mtk_nanohub_custom_cmd;
+
+	err = hf_device_register(hf_dev);
+	if (err < 0) {
+		pr_err("%s hf_device_register fail\n", __func__);
+		return err;
+	}
 
 	err = hf_manager_create(hf_dev);
 	if (err < 0) {

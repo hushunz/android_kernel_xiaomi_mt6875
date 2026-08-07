@@ -73,6 +73,9 @@ struct hf_core {
 	struct list_head manager_list;
 	struct sensor_state state[SENSOR_TYPE_SENSOR_MAX];
 
+	struct mutex device_lock;
+	struct list_head device_list;
+
 	spinlock_t client_lock;
 	struct list_head client_list;
 
@@ -99,6 +102,9 @@ struct hf_device {
 
 	struct sensor_info *support_list;
 	unsigned int support_size;
+
+	struct list_head list;
+	bool ready;
 
 	struct hf_manager *manager;
 	void *private_data;
@@ -165,6 +171,8 @@ static inline void *hf_device_get_private_data(struct hf_device *device)
 
 int hf_manager_create(struct hf_device *device);
 int hf_manager_destroy(struct hf_manager *manager);
+int hf_device_register(struct hf_device *device);
+void hf_device_unregister(struct hf_device *device);
 void coordinate_map(unsigned char direction, int32_t *data);
 struct hf_client *hf_client_create(void);
 void hf_client_destroy(struct hf_client *client);

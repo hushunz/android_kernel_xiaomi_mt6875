@@ -321,6 +321,8 @@ static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
 		if (mtk_crtc) {
 			atomic_set(&mtk_crtc->pf_event, 1);
 			wake_up_interruptible(&mtk_crtc->present_fence_wq);
+			atomic_set(&mtk_crtc->sf_pf_event, 1);
+			wake_up_interruptible(&mtk_crtc->sf_present_fence_wq);
 		}
 	}
 

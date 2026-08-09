@@ -83,8 +83,10 @@ enum DISP_PMQOS_SLOT {
 	(DISP_SLOT_CUR_CONFIG_FENCE_BASE + (0x4 * (n)))
 #define DISP_SLOT_PRESENT_FENCE(n)                                          \
 	(DISP_SLOT_CUR_CONFIG_FENCE(OVL_LAYER_NR) + (0x4 * (n)))
+#define DISP_SLOT_SF_PRESENT_FENCE(n)                                          \
+	(DISP_SLOT_PRESENT_FENCE(MAX_CRTC) + (0x4 * (n)))
 #define DISP_SLOT_SUBTRACTOR_WHEN_FREE_BASE                                    \
-	(DISP_SLOT_PRESENT_FENCE(MAX_CRTC) + 0x4)
+	(DISP_SLOT_SF_PRESENT_FENCE(MAX_CRTC) + 0x4)
 #define DISP_SLOT_SUBTRACTOR_WHEN_FREE(n)                                      \
 	(DISP_SLOT_SUBTRACTOR_WHEN_FREE_BASE + (0x4 * (n)))
 #define DISP_SLOT_ESD_READ_BASE DISP_SLOT_SUBTRACTOR_WHEN_FREE(OVL_LAYER_NR)
@@ -351,6 +353,7 @@ enum MTK_CRTC_PROP {
 	CRTC_PROP_OVERLAP_LAYER_NUM,
 	CRTC_PROP_LYE_IDX,
 	CRTC_PROP_PRES_FENCE_IDX,
+	CRTC_PROP_SF_PRES_FENCE_IDX,
 	CRTC_PROP_DOZE_ACTIVE,
 	CRTC_PROP_OUTPUT_ENABLE,
 	CRTC_PROP_OUTPUT_FENCE_IDX,
@@ -553,6 +556,85 @@ struct disp_ccorr_config {
  * @esd_ctx: ESD check task context
  * @qos_ctx: BW Qos task context
  */
+
+/**
+ * enum CWB_BUFFER_TYPE - user want to use buffer type
+ * @IMAGE_ONLY: u8 *image
+ * @CARRY_METADATA: struct user_cwb_buffer
+ */
+enum CWB_BUFFER_TYPE {
+	IMAGE_ONLY,
+	CARRY_METADATA,
+	BUFFER_TYPE_NR,
+};
+
+struct user_cwb_image {
+	u8 *image;
+	int width, height;
+};
+
+struct user_cwb_metadata {
+	unsigned long long timestamp;
+	unsigned int frameIndex;
+};
+
+struct user_cwb_buffer {
+	struct user_cwb_image data;
+	struct user_cwb_metadata meta;
+};
+
+struct mtk_cwb_buffer_info {
+	struct mtk_rect dst_roi;
+	u32 addr_mva;
+	u64 addr_va;
+	struct drm_framebuffer *fb;
+	unsigned long long timestamp;
+};
+
+struct mtk_cwb_funcs {
+	/**
+	 * @get_buffer:
+	 *
+	 * This function is optional.
+	 *
+	 * If user hooks this callback, driver will use this first when
+	 * wdma irq is arrived. (capture done)
+	 * User need fill buffer address to *buffer.
+	 *
+	 * If user not hooks this callback driver will confirm whether
+	 * mtk_wdma_capture_info->user_buffer is NULL or not.
+	 * User can use setUserBuffer() assigned this param.
+	 */
+	void (*get_buffer)(void **buffer);
+
+	/**
+	 * @copy_done:
+	 *
+	 * When Buffer copy done will be use this callback to notify user.
+	 */
+	void (*copy_done)(void *buffer, enum CWB_BUFFER_TYPE type);
+};
+
+struct mtk_cwb_info {
+	unsigned int enable;
+
+	struct mtk_rect src_roi;
+	unsigned int count;
+	bool is_sec;
+
+	unsigned int buf_idx;
+	struct mtk_cwb_buffer_info buffer[2];
+	unsigned int copy_w;
+	unsigned int copy_h;
+
+	enum addon_scenario scn;
+	struct mtk_ddp_comp *comp;
+
+	void *user_buffer;
+	enum CWB_BUFFER_TYPE type;
+	const struct mtk_cwb_funcs *funcs;
+};
+
 struct mtk_drm_crtc {
 	struct drm_crtc base;
 	bool enabled;
@@ -639,6 +721,17 @@ struct mtk_drm_crtc {
 	wait_queue_head_t present_fence_wq;
 	struct task_struct *pf_release_thread;
 	atomic_t pf_event;
+
+	wait_queue_head_t sf_present_fence_wq;
+	struct task_struct *sf_pf_release_thread;
+	atomic_t sf_pf_event;
+
+	/*capture write back ctx*/
+	struct mutex cwb_lock;
+	struct mtk_cwb_info *cwb_info;
+	struct task_struct *cwb_task;
+	wait_queue_head_t cwb_wq;
+	atomic_t cwb_task_active;
 };
 
 struct mtk_crtc_state {
@@ -695,6 +788,9 @@ struct mtk_ddp_comp *mtk_ddp_comp_request_output(struct mtk_drm_crtc *mtk_crtc);
 /* get fence */
 int mtk_drm_crtc_getfence_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *file_priv);
+int mtk_drm_crtc_get_sf_fence_ioctl(struct drm_device *dev, void *data,
+				    struct drm_file *file_priv);
+void mtk_crtc_cwb_path_disconnect(struct drm_crtc *crtc);
 
 long mtk_crtc_wait_status(struct drm_crtc *crtc, bool status, long timeout);
 int mtk_crtc_path_switch(struct drm_crtc *crtc, unsigned int path_sel,

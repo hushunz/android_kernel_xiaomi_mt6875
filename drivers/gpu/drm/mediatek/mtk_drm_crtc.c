@@ -55,6 +55,179 @@
 #include "mtk_drm_trace.h"
 #include "cmdq-sec.h"
 #include "cmdq-sec-iwc-common.h"
+
+/*
+ * MTKDBG v78: last known OVL layer mva per crtc/layer, updated in
+ * mtk_crtc_ddp_config(). Read from mtk_iommu_isr (hardirq) to locate
+ * the buffer that triggered an IOMMU translation fault. Plain u32/ulong
+ * stores/loads only; no locks (debug aid only).
+ */
+static unsigned long g_mtk_dbg_layer_mva[MAX_CRTC][OVL_LAYER_NR];
+
+/* MTKDBG v190: faulting-iova blacklist. Unmapped-but-protect-pgtable
+ * entries return a non-zero "pa" from iova_to_phys (the M4U fills
+ * protect-page entries on unmap), so pgtable probing cannot tell a
+ * live buffer from a freed one. Record every faulting iova instead;
+ * layer_config skips blacklisted addresses until the SF feeds a new
+ * buffer, and the list is cleared on suspend. */
+#define FAULT_BLACKLIST_MAX 8
+static unsigned long g_mtk_fault_list[FAULT_BLACKLIST_MAX];
+static int g_mtk_fault_cnt;
+unsigned long g_mtk_fault_iova;
+EXPORT_SYMBOL(g_mtk_fault_iova);
+
+int mtk_drm_fault_is_blacklisted(unsigned long iova)
+{
+	int i;
+
+	if (!iova)
+		return 0;
+	for (i = 0; i < g_mtk_fault_cnt; i++) {
+		long delta = (long)(iova - g_mtk_fault_list[i]);
+
+		/* The faulted iova is the AFBC header addr (base +
+		 * tile_offset*16, up to header_offset 0x28000 above the
+		 * layer base); the SF keeps re-committing the freed buffer
+		 * whose base addr sits at fault - [0, 0x28000]. Keep the
+		 * window tight so freshly allocated buffers nearby are not
+		 * falsely skipped. */
+		if (delta >= -0x30000L && delta <= 0x1000L)
+			return 1;
+	}
+	return 0;
+}
+EXPORT_SYMBOL(mtk_drm_fault_is_blacklisted);
+
+void mtk_drm_fault_blacklist_clear(void)
+{
+	g_mtk_fault_cnt = 0;
+}
+EXPORT_SYMBOL(mtk_drm_fault_blacklist_clear);
+
+/* v207: present-fence stall probe. The A12 SF/composer wait in userspace on
+ * the present fence (timeline P_0_13); if a fence is lost - e.g. the shared
+ * DISP_SLOT_PRESENT_FENCE slot gets overwritten by a newer commit before the
+ * release thread reads it - the composer blocks in sync_wait for tens of
+ * seconds (observed: SF HwBinder stuck 30~51.8s -> vsync binder ENOSPC ->
+ * zygote SIGKILL -> framework restart). Track created (GETF) vs released idx
+ * and dump every 2s while the pipeline is supposed to be live. */
+static unsigned int g_pf_released[MAX_CRTC];
+static int g_pf_released_valid[MAX_CRTC];
+static unsigned long g_last_cmdq_cb_jiffies;
+
+static void mtk_drm_pf_watchdog(struct work_struct *ws)
+{
+	extern struct mtk_drm_private *g_mtk_private;
+	struct mtk_drm_private *private = g_mtk_private;
+	int i;
+
+	if (!private)
+		return;
+	if (g_last_cmdq_cb_jiffies &&
+	    time_after(jiffies, g_last_cmdq_cb_jiffies + 2 * HZ))
+		pr_notice("MTKDBG CB_STALL cmdq_cb_age=%ums\n",
+			  jiffies_to_msecs(jiffies - g_last_cmdq_cb_jiffies));
+	for (i = 0; i < MAX_CRTC; i++) {
+		struct mtk_drm_crtc *mtk_crtc;
+		unsigned int created, released;
+
+		if (!private->crtc[i])
+			continue;
+		mtk_crtc = to_mtk_crtc(private->crtc[i]);
+		created = atomic_read(&private->crtc_present[i]);
+		released = g_pf_released[i];
+		/* steady state has a 2-fence backlog (commit + config in
+		 * flight); only report when it grows beyond that */
+		if (created - released > 4) {
+			pr_notice("MTKDBG FENCE_STALL crtc=%d created=%u released=%u enabled=%d trig_loop=%p\n",
+				  i, created, released,
+				  mtk_crtc->enabled,
+				  mtk_crtc->trig_loop_cmdq_handle);
+		}
+	}
+	schedule_delayed_work(to_delayed_work(ws), msecs_to_jiffies(2000));
+}
+static DECLARE_DELAYED_WORK(g_pf_watchdog_work, mtk_drm_pf_watchdog);
+
+/* MTKDBG v201: force-set STREAM_BLOCK/EOF via CMDQ_SYNC_TOKEN_UPD to
+ * wake the cmdq main-thread waiter; defined after mtk_crtc_clear_wait_event. */
+static void mtk_crtc_force_set_stream_events(struct drm_crtc *crtc);
+/* MTKDBG v212: complete a faulted frame (defined after force_set). */
+static void mtk_crtc_complete_faulted_frame(struct drm_crtc *crtc);
+
+/* A12 kernel.elf registers NO display fault callback at all: an M4U
+ * translation fault is just logged by the iommu driver and the HW absorbs
+ * the bad read via the TFRP protect page - the frame still completes and
+ * the next commit heals the layer. Every "recovery" attempt on top of
+ * that (layer clearing, DSI reset, loop restart, forced edges) was
+ * self-inflicted damage: clearing the OVL registers from the fault ISR
+ * breaks the frame mid-transfer, CMD_EOF never fires, the loop parks and
+ * the CFG thread deadlocks on wait(641) - the v210 freeze at ~89s was
+ * exactly this (fault_iova=0xf4367000 protect-page + handler clearing).
+ * v211: log-only, exactly like stock A12. The dump is rate-limited to
+ * one per second so a per-frame fault burst doesn't flood the console. */
+void mtk_drm_dbg_dump_ovl_layers(unsigned long fault_iova)
+{
+	static unsigned long last_dump_jiffies;
+
+	pr_notice("MTKDBG IOMMU_FAULT iova=0x%lx\n", fault_iova);
+	g_mtk_fault_iova = fault_iova;
+
+	if (time_after(jiffies, last_dump_jiffies + HZ)) {
+		unsigned int c, l;
+
+		last_dump_jiffies = jiffies;
+		for (c = 0; c < MAX_CRTC; c++) {
+			for (l = 0; l < OVL_LAYER_NR; l++) {
+				if (g_mtk_dbg_layer_mva[c][l])
+					pr_notice("MTKDBG OVL crtc=%u layer=%u mva=0x%lx\n",
+						  c, l, g_mtk_dbg_layer_mva[c][l]);
+			}
+		}
+		/* live OVL registers at fault time - diagnostic only, no
+		 * writes: the fault port is Lx_OVL_RDMAx_HDR, so HDR_ADDR is
+		 * the address actually being read when the translation faults. */
+		{
+			extern struct mtk_drm_private *g_mtk_private;
+			struct mtk_drm_private *private = g_mtk_private;
+			struct mtk_ddp_comp *ovl_comp[2];
+			int c;
+
+			if (private) {
+				ovl_comp[0] = private->ddp_comp[DDP_COMPONENT_OVL0];
+				ovl_comp[1] = private->ddp_comp[DDP_COMPONENT_OVL1];
+				for (c = 0; c < 2; c++) {
+					struct mtk_ddp_comp *ovl0 = ovl_comp[c];
+					int i;
+
+					if (!ovl0 || !ovl0->regs)
+						continue;
+					pr_notice("MTKDBG FAULT_DUMP OVL%d EN=0x%x DATAPATH_CON=0x%x\n",
+						  c, readl(ovl0->regs + 0x0c),
+						  readl(ovl0->regs + 0x24));
+					for (i = 0; i < 4; i++)
+						pr_notice("MTKDBG FAULT_DUMP L%d CON=0x%x ADDR=0x%x SRC=0x%x HDR_ADDR=0x%x\n",
+							  i,
+							  readl(ovl0->regs + 0x30 + 0x20 * i),
+							  readl(ovl0->regs + 0xf40 + 0x20 * i),
+							  readl(ovl0->regs + 0x38 + 0x20 * i),
+							  readl(ovl0->regs + 0xf44 + 0x20 * i));
+				}
+				/* v212: the fault wedged the current frame (the RDMA
+				 * stall never lets DSI finish) - complete it so
+				 * the parked loop cycles on. No register writes
+				 * to the OVL (v211 proved those break the frame
+				 * even worse); the token poke only releases the
+				 * loop, the next commit heals the layer. */
+				if (private->crtc[0] &&
+				    mtk_crtc_with_trigger_loop(private->crtc[0]))
+					mtk_crtc_complete_faulted_frame(
+						private->crtc[0]);
+			}
+		}
+	}
+}
+EXPORT_SYMBOL(mtk_drm_dbg_dump_ovl_layers);
 #include "mtk_disp_ccorr.h"
 
 /* *****Panel_Master*********** */
@@ -62,25 +235,33 @@
 #include "mtk_layering_rule_base.h"
 
 static struct mtk_drm_property mtk_crtc_property[CRTC_PROP_MAX] = {
-	{DRM_MODE_PROP_ATOMIC, "OVERLAP_LAYER_NUM", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "LAYERING_IDX", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "PRESENT_FENCE", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "DOZE_ACTIVE", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "OUTPUT_ENABLE", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "OUTPUT_BUFF_IDX", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "OUTPUT_X", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "OUTPUT_Y", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "OUTPUT_WIDTH", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "OUTPUT_HEIGHT", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "OUTPUT_FB_ID", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "INTF_BUFF_IDX", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "DISP_MODE_IDX", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "HBM_ENABLE", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "COLOR_TRANSFORM", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "USER_SCEN", 0, UINT_MAX, 0},
+	/* order matches A12 kernel (hwcomposer uses fixed property index) */
+	{DRM_MODE_PROP_ATOMIC, "OVL_DSI_SEQ", 0, UINT_MAX, 0},
 	{DRM_MODE_PROP_ATOMIC, "HDR_ENABLE", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "USER_SCEN", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "COLOR_TRANSFORM", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "HBM_ENABLE", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "DISP_MODE_IDX", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "INTF_BUFF_IDX", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "OUTPUT_FB_ID", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "OUTPUT_HEIGHT", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "OUTPUT_WIDTH", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "OUTPUT_Y", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "OUTPUT_X", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "OUTPUT_BUFF_IDX", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "OUTPUT_ENABLE", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "DOZE_ACTIVE", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "SF_PRESENT_FENCE", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "PRESENT_FENCE", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "LAYERING_IDX", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "OVERLAP_LAYER_NUM", 0, UINT_MAX, 0},
+	/* A11 extras kept at the end */
 	{DRM_MODE_PROP_ATOMIC, "ICON_ENABLE", 0, UINT_MAX, 0},
 	{DRM_MODE_PROP_ATOMIC, "ENROLL_ENABLE", 0, UINT_MAX, 0},
+	/* A12 hwcomposer DrmObject::checkProperty() fails with -EINVAL when
+	 * these two are missing from the crtc property list */
+	{DRM_MODE_PROP_ATOMIC, "MSYNC2_0_ENABLE", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "SKIP_CONFIG", 0, UINT_MAX, 0},
 };
 
 bool hdr_en;
@@ -696,13 +877,6 @@ int mtk_drm_setbacklight(struct drm_crtc *crtc, unsigned int level)
 		mtk_crtc_wait_frame_done(mtk_crtc, cmdq_handle,
 			DDP_FIRST_PATH, 0);
 
-	if (is_frame_mode) {
-		cmdq_pkt_wfe(cmdq_handle,
-			mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
-		cmdq_pkt_clear_event(cmdq_handle,
-			mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
-	}
-
 	/* set backlight */
 	if (comp->funcs && comp->funcs->io_cmd)
 		comp->funcs->io_cmd(comp, cmdq_handle, DSI_SET_BL, &level);
@@ -765,10 +939,12 @@ int mtk_drm_setbacklight_grp(struct drm_crtc *crtc, unsigned int level)
 	cmdq_handle = cmdq_pkt_create(mtk_crtc->gce_obj.client[CLIENT_CFG]);
 
 	if (is_frame_mode) {
-		cmdq_pkt_wfe(cmdq_handle,
-				mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
-		cmdq_pkt_clear_event(cmdq_handle,
-				mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
+		/* A12: no wfe(CABC_EOF)/clear(STREAM_DIRTY) - CABC_EOF is
+		 * one-shot (wfe clears it, the trig loop stops re-setting it
+		 * when it parks on wfe(57) during screen-off), so a wait here
+		 * blocks the CFG thread and the black-frame layer-disable pkt
+		 * never runs. wait_frame_done above is already the A12 SET.
+		 */
 	}
 
 	if (mtk_crtc_with_sub_path(crtc, mtk_crtc->ddp_mode))
@@ -834,13 +1010,6 @@ static int mtk_drm_crtc_set_pcc(struct drm_crtc *crtc, bool hbm_en) {
 
 	mtk_crtc_wait_frame_done(mtk_crtc, cmdq_handle, DDP_FIRST_PATH, 0);
 
-	if (is_frame_mode) {
-		cmdq_pkt_wfe(cmdq_handle,
-			     mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
-		cmdq_pkt_clear_event(cmdq_handle,
-				mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
-	}
-
 	if (hbm_en) {
 		hbm_cmd = "panel_HBM=1";
 	} else {
@@ -862,6 +1031,8 @@ static int mtk_drm_crtc_set_pcc(struct drm_crtc *crtc, bool hbm_en) {
 
 static void mtk_drm_crtc_wk_lock(struct drm_crtc *crtc, bool get,
 	const char *func, int line);
+static void mtk_crtc_force_set_stream_events(struct drm_crtc *crtc);
+
 int mtk_drm_aod_setbacklight(struct drm_crtc *crtc, unsigned int level)
 {
 
@@ -908,6 +1079,21 @@ int mtk_drm_aod_setbacklight(struct drm_crtc *crtc, unsigned int level)
 
 		for_each_comp_in_cur_crtc_path(comp, mtk_crtc, i, j)
 			mtk_dump_analysis(comp);
+
+		/* v208: the screen-off cycle leaves a commit pkt parked on
+		 * wfe(STREAM_EOF=641) on the CFG thread (the loop stopped while
+		 * the commit was in flight, the edge was missed). Every later
+		 * commit - and this very wake pkt, flushed on CLIENT_CFG -
+		 * queues behind it: no EOF, no DIRTY, no ddp_cmdq_cb, present
+		 * fences never signal, SF freezes and the framework watchdog
+		 * kills zygote (proven by the v207 probes: after the 3rd
+		 * screen-off created froze at 2604, cb age >10s, backlight
+		 * never came back). Pulse the edges once through the
+		 * CMDQ_SYNC_TOKEN_UPD register - this bypasses the parked CFG
+		 * thread entirely: the loop wakes on the DIRTY edge, produces
+		 * a frame, sets EOF, and the parked commit proceeds. */
+		if (mtk_crtc_with_trigger_loop(crtc))
+			mtk_crtc_force_set_stream_events(crtc);
 	}
 
 	/* send LCM CMD */
@@ -921,12 +1107,6 @@ int mtk_drm_aod_setbacklight(struct drm_crtc *crtc, unsigned int level)
 			cmdq_pkt_create(
 			mtk_crtc->gce_obj.client[CLIENT_DSI_CFG]);
 
-	if (is_frame_mode) {
-		cmdq_pkt_wfe(cmdq_handle,
-			mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
-		cmdq_pkt_clear_event(cmdq_handle,
-			mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
-	}
 
 	if (mtk_crtc_with_sub_path(crtc, mtk_crtc->ddp_mode))
 		mtk_crtc_wait_frame_done(mtk_crtc, cmdq_handle,
@@ -1003,14 +1183,6 @@ static int mtk_drm_crtc_set_panel_hbm(struct drm_crtc *crtc, bool en)
 
 	mtk_crtc_wait_frame_done(mtk_crtc, cmdq_handle, DDP_FIRST_PATH, 0);
 
-	if (is_frame_mode) {
-		cmdq_pkt_clear_event(cmdq_handle,
-			mtk_crtc->gce_obj.event[EVENT_STREAM_BLOCK]);
-		cmdq_pkt_wfe(cmdq_handle,
-			mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
-		cmdq_pkt_clear_event(cmdq_handle,
-			mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
-	}
 
 	if (comp->funcs && comp->funcs->io_cmd)
 		comp->funcs->io_cmd(comp, cmdq_handle, DSI_HBM_SET, &en);
@@ -1859,6 +2031,32 @@ static void mtk_crtc_get_plane_comp_state(struct drm_crtc *crtc,
 
 		mtk_plane_get_comp_state(plane, &plane_state->comp_state, crtc,
 					 0);
+
+		/* A12: when the HWC layer blob is missing (lye_idx mismatch,
+		 * e.g. screen-off/suspend), fall back to assigning the comp by
+		 * plane index - OVL0_2L takes the first 2 layers, OVL0 the
+		 * next 4 (same table the A12 kernel uses in this path). This
+		 * keeps every layer on a valid OVL so the pipeline keeps
+		 * producing frames (DSI FRAME_DONE keeps coming, the trig
+		 * loop does not stall on WFE 57, and the black screen-off
+		 * frame does not deadlock the whole display).
+		 */
+		if (plane_state->comp_state.comp_id == 0) {
+			struct mtk_ddp_comp *ovl2l =
+				mtk_crtc_get_comp(crtc, 0, 0);
+			int lnr = ovl2l ? mtk_ovl_layer_num(ovl2l) : 2;
+
+			if (i < lnr) {
+				plane_state->comp_state.comp_id =
+					DDP_COMPONENT_OVL0_2L;
+				plane_state->comp_state.lye_id = i;
+			} else {
+				plane_state->comp_state.comp_id =
+					DDP_COMPONENT_OVL0;
+				plane_state->comp_state.lye_id = i - lnr;
+			}
+			plane_state->comp_state.ext_lye_id = LYE_NORMAL;
+		}
 	}
 }
 unsigned int mtk_drm_primary_frame_bw(struct drm_crtc *i_crtc)
@@ -2468,6 +2666,15 @@ void mtk_crtc_wait_frame_done(struct mtk_drm_crtc *mtk_crtc,
 		if (clear_event)
 			cmdq_pkt_wfe(cmdq_handle, gce_event);
 		else
+			/* A12 (mtk_crtc_wait_frame_done @0xffffff800884b4d0,
+			 * clear_event==0): wait_no_clear(STREAM_EOF) - the loop
+			 * keeps EOF set at all times (sets it at the end of every
+			 * frame, only its own clear(641) or crtc_stop's wfe drops
+			 * it), so this is a state check that passes instantly and
+			 * only stalls when the loop is actually mid-frame. The
+			 * old set() skipped the check; a wfe() would clear EOF and
+			 * desync the commit/loop handshake.
+			 */
 			cmdq_pkt_wait_no_clear(cmdq_handle, gce_event);
 		priv = mtk_crtc->base.dev->dev_private;
 		if (gce_event == mtk_crtc->gce_obj.event[EVENT_VDO_EOF] &&
@@ -2488,10 +2695,14 @@ void mtk_crtc_wait_frame_done(struct mtk_drm_crtc *mtk_crtc,
 		DDPPR_ERR("The output component has not frame done event\n");
 }
 
+/* MTKDBG v93: forward decl removed - crtc reset recovery dropped,
+ * A12 trig loop semantics used instead */
+
 static void mtk_crtc_cmdq_timeout_cb(struct cmdq_cb_data data)
 {
 	struct drm_crtc *crtc = data.data;
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct mtk_drm_private *priv;
 	struct cmdq_client *cl;
 	dma_addr_t trig_pc;
 	u64 *inst;
@@ -2501,8 +2712,83 @@ static void mtk_crtc_cmdq_timeout_cb(struct cmdq_cb_data data)
 		return;
 	}
 
-	DDPPR_ERR("%s cmdq timeout, crtc id:%d\n", __func__,
-		  drm_crtc_index(crtc));
+	priv = crtc->dev->dev_private;
+
+	DDPPR_ERR("%s cmdq timeout, crtc id:%d err=%d\n", __func__,
+		  drm_crtc_index(crtc), data.err);
+
+	/* MTKDBG v205: while the panel is OFF the trig loop is expected
+	 * to stall (TE/FRAME_DONE never come) and its timeout fires once
+	 * per screen-off. Resetting the DSI engine and force-setting
+	 * DIRTY/EOF here corrupts the powered-down state - after a few
+	 * suspend/resume cycles SystemUI then fails to draw on wakeup
+	 * (SCREEN_OFF broadcast ANR, "Timeout waiting for drawn"). Only
+	 * dump the stuck state; the loop is restarted by the enable path
+	 * on the next screen-on anyway. */
+	if (!mtk_crtc->enabled) {
+		mtk_drm_crtc_analysis(crtc);
+		return;
+	}
+
+	/* The loop is stuck on WFE(FRAME_DONE=57) after an IOMMU fault
+	 * left DSI BUSY waiting for data that never arrived. Reset the
+	 * DSI engine on every timeout so that once SF feeds fresh
+	 * buffers the next trigger completes and the loop recovers.
+	 */
+	{
+		struct mtk_ddp_comp *dsi_comp =
+			priv->ddp_comp[DDP_COMPONENT_DSI0];
+
+		if (dsi_comp && dsi_comp->funcs &&
+		    dsi_comp->funcs->io_cmd)
+			dsi_comp->funcs->io_cmd(dsi_comp, NULL,
+						CONNECTOR_RESET, NULL);
+	}
+
+	/* v201: the cmdq main thread is stuck waiting for STREAM_EOF(641)
+	 * of the faulted frame; wake it so queued commits drain and the
+	 * restarted trig loop can get new DIRTY events again. */
+	mtk_crtc_force_set_stream_events(crtc);
+
+	/* v212: the loop itself may be parked on wfe(CMD_EOF) - the faulted
+	 * frame never completes on its own (TFRP does not absorb it on this
+	 * HW, v211). With the DSI just reset above, completing the frame
+	 * token lets the loop cycle instead of staying parked. */
+	mtk_crtc_complete_faulted_frame(crtc);
+
+	/* MTKDBG v144: dump the CFG client thread too - when the loop was
+	 * already stopped (handle==NULL) the loop-only dump below prints
+	 * nothing and the stuck pkt lives on the CLIENT_CFG thread.
+	 */
+	if (mtk_crtc->gce_obj.client[CLIENT_CFG] &&
+	    mtk_crtc->gce_obj.client[CLIENT_CFG]->chan) {
+		struct cmdq_client *cfg_cl =
+			mtk_crtc->gce_obj.client[CLIENT_CFG];
+		u64 *cfg_inst = NULL;
+		dma_addr_t cfg_pc = 0;
+
+		/* MTKDBG v156: current values of the loop's sync events -
+		 * TE(147) / CMD_EOF(57) / STREAM_EOF(641) / STREAM_DIRTY(640)
+		 */
+		DDPPR_ERR("MTKDBG EVENTS te=%u eof57=%u seof=%u dirty=%u\n",
+			  cmdq_get_event(cfg_cl->chan,
+					 mtk_crtc->gce_obj.event[EVENT_TE]),
+			  cmdq_get_event(cfg_cl->chan,
+					 mtk_crtc->gce_obj.event[EVENT_CMD_EOF]),
+			  cmdq_get_event(cfg_cl->chan,
+					 mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]),
+			  cmdq_get_event(cfg_cl->chan,
+					 mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]));
+
+		cmdq_thread_dump(cfg_cl->chan, NULL, &cfg_inst, &cfg_pc);
+		if (cfg_inst)
+			DDPPR_ERR("MTKDBG CFG_THREAD pc=0x%llx inst=0x%016llx op=0x%x evt=%u\n",
+				  (unsigned long long)cfg_pc,
+				  (unsigned long long)*cfg_inst,
+				  (*cfg_inst >> 56) & 0xff,
+				  (*cfg_inst >> 32) & 0xffff);
+	}
+
 	mtk_drm_crtc_analysis(crtc);
 	mtk_drm_crtc_dump(crtc);
 
@@ -2510,10 +2796,165 @@ static void mtk_crtc_cmdq_timeout_cb(struct cmdq_cb_data data)
 		cl = (struct cmdq_client *)mtk_crtc->trig_loop_cmdq_handle->cl;
 		DDPMSG("++++++ Dump trigger loop ++++++\n");
 		cmdq_thread_dump(cl->chan, mtk_crtc->trig_loop_cmdq_handle, &inst, &trig_pc);
+		/* MTKDBG v80: decode current GCE instruction (CMDQ_CODE_WFE=0x20) */
+		if (inst) {
+			u64 raw = *inst;
+			u16 arg_c = raw & 0xffff;
+			u16 arg_b = (raw >> 16) & 0xffff;
+			u16 arg_a = (raw >> 32) & 0xffff;
+			u8 op = (raw >> 56) & 0xff;
+			u32 cmd = ((u32)arg_b << 16) | arg_c;
+
+			DDPPR_ERR("MTKDBG CMDQ_TIMEOUT crtc=%d pc=0x%llx raw=0x%llx op=0x%x evt=%u cmd=0x%x\n",
+				  drm_crtc_index(crtc),
+				  (unsigned long long)trig_pc,
+				  (unsigned long long)raw, op, arg_a, cmd);
+			if (op == 0x20) {
+				if (cmd & 0x8000)
+					DDPPR_ERR("MTKDBG CMDQ WAIT event %u -> %u\n",
+						  arg_a, arg_c & 0xfff);
+				else if (cmd & 0x80000000)
+					DDPPR_ERR("MTKDBG CMDQ SYNC event %u %s to %u\n",
+						  arg_a,
+						  (arg_b & 0xfff) ? "set" : "clear",
+						  arg_b & 0xfff);
+			}
+		} else {
+			DDPPR_ERR("MTKDBG CMDQ_TIMEOUT crtc=%d pc=0x%llx inst=N/A\n",
+				  drm_crtc_index(crtc),
+				  (unsigned long long)trig_pc);
+		}
 		cmdq_dump_pkt(mtk_crtc->trig_loop_cmdq_handle, trig_pc, true);
 		DDPMSG("------ Dump trigger loop ------\n");
+
+		/* MTKDBG v91: only the current instruction is readable here -
+		 * walking inst+/-N can fault (inst may point near the loop
+		 * buffer boundary), which crashed the timeout cb at 2.69s.
+		 */
+		if (inst) {
+			u64 raw = *inst;
+
+			DDPPR_ERR("MTKDBG CMDQ[0] = 0x%016llx (op=0x%x evt=%u)\n",
+				  (unsigned long long)raw,
+				  (raw >> 56) & 0xff,
+				  (raw >> 32) & 0xffff);
+		}
 	}
 
+	/* MTKDBG v83: dump OVL0/RDMA0/DSI0 hw state to find what stalls */
+	{
+		struct mtk_ddp_comp *ovl =
+			priv->ddp_comp[DDP_COMPONENT_OVL0];
+		struct mtk_ddp_comp *rdma =
+			priv->ddp_comp[DDP_COMPONENT_RDMA0];
+		struct mtk_ddp_comp *dsi =
+			priv->ddp_comp[DDP_COMPONENT_DSI0];
+		struct mtk_crtc_state *mtk_state =
+			to_mtk_crtc_state(crtc->state);
+		int li;
+
+		DDPPR_ERR("MTKDBG STATE DOZE_ACTIVE=%d enabled=%d\n",
+			  mtk_state->prop_val[CRTC_PROP_DOZE_ACTIVE],
+			  mtk_crtc->enabled);
+		if (ovl && ovl->regs) {
+			DDPPR_ERR("MTKDBG OVL0 EN=0x%x INTEN=0x%x INTSTA=0x%x FLOW=0x%x\n",
+				  readl(ovl->regs + 0x0C),
+				  readl(ovl->regs + 0x04),
+				  readl(ovl->regs + 0x08),
+				  readl(ovl->regs + 0x240));
+			/* MTKDBG: RDMA_CTRL/SRC_CON/DATAPATH/CLRFMT - layer RDMA
+			 * start state (greq=0 means layer RDMA never started)
+			 */
+			DDPPR_ERR("MTKDBG OVL0 RDMA_CTRL=0x%x,0x%x,0x%x,0x%x SRC_CON=0x%x DATAPATH=0x%x CLRFMT=0x%x EN_FULL=0x%x\n",
+				  readl(ovl->regs + 0xC0),
+				  readl(ovl->regs + 0xE0),
+				  readl(ovl->regs + 0x100),
+				  readl(ovl->regs + 0x120),
+				  readl(ovl->regs + 0x2C),
+				  readl(ovl->regs + 0x24),
+				  readl(ovl->regs + 0x2D0),
+				  readl(ovl->regs + 0x0C));
+			for (li = 0; li < 4; li++)
+				DDPPR_ERR("MTKDBG OVL0 L%d CON=0x%x ADDR=0x%x SRC_SIZE=0x%x\n",
+					  li,
+					  readl(ovl->regs + 0x30 + 0x20 * li),
+					  readl(ovl->regs + 0xF40 + 0x20 * li),
+					  readl(ovl->regs + 0x38 + 0x20 * li));
+		}
+		if (rdma && rdma->regs)
+			DDPPR_ERR("MTKDBG RDMA0 INTEN=0x%x INTSTA=0x%x GLOBAL=0x%x MEM_ADDR=0x%x\n",
+				  readl(rdma->regs + 0x00),
+				  readl(rdma->regs + 0x04),
+				  readl(rdma->regs + 0x10),
+				  readl(rdma->regs + 0xF00));
+		if (rdma && rdma->regs)
+			/* MTKDBG v160: RDMA0 data counters - stuck at 0 means the
+			 * layer RDMAs never feed it (MUTEX SOF never came). */
+			DDPPR_ERR("MTKDBG RDMA0 IN_P=0x%x IN_L=0x%x OUT_P=0x%x OUT_L=0x%x FIFO_CON=0x%x\n",
+				  readl(rdma->regs + 0x120),
+				  readl(rdma->regs + 0x124),
+				  readl(rdma->regs + 0x128),
+				  readl(rdma->regs + 0x12c),
+				  readl(rdma->regs + 0x40));
+		if (dsi && dsi->regs)
+			DDPPR_ERR("MTKDBG DSI0 START=0x%x CON=0x%x INTSTA=0x%x MODE=0x%x PSCTRL=0x%x VFP=0x%x\n",
+				  readl(dsi->regs + 0x00),
+				  readl(dsi->regs + 0x10),
+				  readl(dsi->regs + 0x0C),
+				  readl(dsi->regs + 0x14),
+				  readl(dsi->regs + 0x1C),
+				  readl(dsi->regs + 0x28));
+		if (dsi && dsi->regs)
+			/* MTKDBG v160: DSI frame geometry/buffer state - VACT_NL=0
+			 * means the DSI was never given a frame height,
+			 * SIZE_CON holds the transfer size, LFR_STA the
+			 * low-frame-rate skip state, CMDQ_SIZE the command
+			 * queue depth. */
+			DDPPR_ERR("MTKDBG DSI0 INTEN=0x%x VACT=0x%x SIZE_CON=0x%x LFR_CON=0x%x LFR_STA=0x%x CMDQ_SIZE=0x%x\n",
+				  readl(dsi->regs + 0x08),
+				  readl(dsi->regs + 0x2C),
+				  readl(dsi->regs + 0x38),
+				  readl(dsi->regs + 0x30),
+				  readl(dsi->regs + 0x34),
+				  readl(dsi->regs + 0x60));
+		if (ovl && ovl->regs)
+			/* MTKDBG v160: OVL background color - relay mode outputs
+			 * this when all layers are off. */
+			DDPPR_ERR("MTKDBG OVL0 BGCLR=0x%x\n",
+				  readl(ovl->regs + 0x28));
+
+		/* MTKDBG v85: SMI/MMSYS DL status (greq=1 means SMI not grant) */
+			if (priv->config_regs) {
+				DDPPR_ERR("MTKDBG MMSYS v0-2=0x%x,0x%x,0x%x r0-2=0x%x,0x%x,0x%x greq0=0x%x greq1=0x%x\n",
+					  readl(priv->config_regs + 0xe9c),
+					  readl(priv->config_regs + 0xea0),
+					  readl(priv->config_regs + 0xea4),
+					  readl(priv->config_regs + 0xea8),
+					  readl(priv->config_regs + 0xeac),
+					  readl(priv->config_regs + 0xeb0),
+					  readl(priv->config_regs + 0x8dc),
+					  readl(priv->config_regs + 0x8e0));
+				DDPPR_ERR("MTKDBG MMSYS v3-5=0x%x,0x%x,0x%x r3-5=0x%x,0x%x,0x%x\n",
+					  readl(priv->config_regs + 0xe80),
+					  readl(priv->config_regs + 0xe84),
+					  readl(priv->config_regs + 0xe88),
+					  readl(priv->config_regs + 0xe70),
+					  readl(priv->config_regs + 0xe74),
+					  readl(priv->config_regs + 0xe78));
+				/* MTKDBG v164: the ACTUAL OVL0->RDMA0 link regs -
+				 * MMSYS_OVL_CON(0xf4c) selects OVL0's blend-out,
+				 * TOVL0_OUT1_MOUT_EN(0xf74) bit0 gates
+				 * OVL0_VIRTUAL0->RDMA0. 0 here means the path
+				 * was never (re)connected on resume. */
+				DDPPR_ERR("MTKDBG MMSYS OVL_CON=0x%x TOVL0_OUT1=0x%x\n",
+					  readl(priv->config_regs + 0xf4c),
+					  readl(priv->config_regs + 0xf74));
+			}
+			/* MTKDBG v87: real mutex regs via ddp (ERR level) */
+			if (mtk_crtc->mutex[0])
+				mutex_dump_analysis_mt6885(mtk_crtc->mutex[0]);
+		}
+	
 	/* CMDQ driver would not trigger aee when timeout. */
 	DDPAEE("%s cmdq timeout, crtc id:%d\n", __func__, drm_crtc_index(crtc));
 	aee_kernel_exception_api(__FILE__, __LINE__, DB_OPT_DEFAULT|DB_OPT_MMPROFILE_BUFFER,
@@ -2525,7 +2966,7 @@ void mtk_crtc_pkt_create(struct cmdq_pkt **cmdq_handle, struct drm_crtc *crtc,
 {
 	*cmdq_handle = cmdq_pkt_create(cl);
 	if (IS_ERR_OR_NULL(*cmdq_handle)) {
-		DDPPR_ERR("%s create handle fail, %x\n",
+		DDPPR_ERR("%s create handle fail, %p\n",
 				__func__, *cmdq_handle);
 		return;
 	}
@@ -2858,6 +3299,8 @@ static void ddp_cmdq_cb(struct cmdq_cb_data data)
 		atomic_state,
 		crtc);
 
+	g_last_cmdq_cb_jiffies = jiffies;
+
 	session_id = mtk_get_session_id(crtc);
 
 	id = drm_crtc_index(crtc);
@@ -2884,6 +3327,13 @@ static void ddp_cmdq_cb(struct cmdq_cb_data data)
 #endif
 	}
 	CRTC_MMP_MARK(id, frame_cfg, ovl_status, 0);
+
+	/* Present fence is released on RDMA frame_start only (A12
+	 * kernel.elf mtk_disp_rdma_isr) - releasing here (flush done)
+	 * signals the SF while the OVL still holds the previous layer
+	 * config for the next scanout, so the SF frees a buffer the OVL
+	 * is about to read -> IOMMU fault (L0_OVL_RDMA0_HDR) + pipeline
+	 * death. No fence release in ddp_cmdq_cb, exactly like A12. */
 
 	mtk_crtc_release_input_layer_fence(crtc, session_id);
 
@@ -3026,6 +3476,10 @@ static void mtk_crtc_ddp_config(struct drm_crtc *crtc)
 
 		mtk_ddp_comp_layer_config(comp, i, plane_state, cmdq_handle);
 
+		/* MTKDBG v78: track layer mva for IOMMU fault attribution */
+		g_mtk_dbg_layer_mva[drm_crtc_index(crtc)][i] =
+			plane_state->pending.addr;
+
 		last_fence = *(unsigned int *)(cmdq_buf->va_base +
 					       DISP_SLOT_CUR_CONFIG_FENCE(i));
 		cur_fence =
@@ -3082,7 +3536,34 @@ int mtk_crtc_comp_is_busy(struct mtk_drm_crtc *mtk_crtc)
 /* TODO: need to remove this in vdo mode for lowpower */
 static void trig_done_cb(struct cmdq_cb_data data)
 {
+	/* MTKDBG v162: MUTEX0 EN + MMSYS DL state at loop completion
+	 * (rate-limited). DL_VALID_0=0 while READY!=0 means the
+	 * OVL0->RDMA0 link never handshakes even though the SOF was
+	 * produced (EN auto-clears), i.e. the stall is in the MMSYS
+	 * connection, not in the trigger. */
+	{
+		static unsigned int dbg_cnt;
+		extern void mtk_drm_mmsys_dump(void);
+
+		if (++dbg_cnt % 100 == 1)
+			mtk_drm_mmsys_dump();
+	}
 	CRTC_MMP_MARK((unsigned long)data.data, trig_loop_done, 0, 0);
+}
+
+/* A12: LAYER_REC is gated by DSI0 presence/enable in the path,
+ * not by the MTK_DRM_OPT_LAYER_REC helper option.
+ */
+bool mtk_crtc_dsi0_in_path(struct mtk_drm_crtc *mtk_crtc)
+{
+	int i, j;
+	struct mtk_ddp_comp *comp;
+
+	for_each_comp_in_cur_crtc_path(comp, mtk_crtc, i, j) {
+		if (comp->id == DDP_COMPONENT_DSI0)
+			return !comp->blank_mode;
+	}
+	return false;
 }
 
 void mtk_crtc_clear_wait_event(struct drm_crtc *crtc)
@@ -3093,6 +3574,15 @@ void mtk_crtc_clear_wait_event(struct drm_crtc *crtc)
 	if (mtk_crtc_is_frame_trigger_mode(crtc)) {
 		mtk_crtc_pkt_create(&cmdq_handle, crtc,
 			mtk_crtc->gce_obj.client[CLIENT_CFG]);
+		/* A12 arms STREAM_BLOCK from the enable path too (its
+		 * mtk_output_dsi_enable packet ends with set(STREAM_BLOCK));
+		 * the A12 trig loop starts with wait_no_clear(STREAM_BLOCK)
+		 * and would idle forever on it if nothing set it first.
+		 * mtk_crtc_stop / output_dsi_disable clear BLOCK to park the
+		 * loop, so every (re)start must re-arm it here.
+		 */
+		cmdq_pkt_set_event(cmdq_handle,
+				   mtk_crtc->gce_obj.event[EVENT_STREAM_BLOCK]);
 		cmdq_pkt_set_event(cmdq_handle,
 				   mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
 		cmdq_pkt_set_event(cmdq_handle,
@@ -3104,6 +3594,110 @@ void mtk_crtc_clear_wait_event(struct drm_crtc *crtc)
 	}
 
 }
+
+/* MTKDBG v201: force-set the stream events through the GCE sync-token
+ * register, bypassing the cmdq queues. After an IOMMU fault the pkt
+ * composer posted on the cmdq main thread waits for STREAM_EOF(641)
+ * (Pre-dump: "[Sync] wait for event 641 become 1 value:0"), which the
+ * killed trig loop never sets again - every later commit queues behind
+ * it and the display pipeline deadlocks. mtk_crtc_clear_wait_event
+ * cannot be used from the fault/timeout path: it flushes through
+ * CLIENT_CFG, the very thread that is stuck. Writing
+ * CMDQ_SYNC_TOKEN_UPD wakes the waiter immediately so the queued
+ * commits drain and the restarted trig loop gets fresh DIRTY events.
+ *
+ * MTKDBG v203: the GCE Sync wait is edge-triggered - a task posted
+ * AFTER our set misses the EOF edge and parks forever (1s Pre-dump
+ * loop). clear+set guarantees an edge for whoever is waiting, and
+ * additionally clear+set DIRTY(640) wakes the trig loop (its
+ * wait(640) is "become 1 and clear") so it produces the next real EOF
+ * itself. Extra sets are harmless: EOF is consumed by the waiter and
+ * DIRTY by the loop's wait-and-clear.
+ */
+static void mtk_crtc_force_set_stream_events(struct drm_crtc *crtc)
+{
+	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct cmdq_client *cfg_cl = mtk_crtc->gce_obj.client[CLIENT_CFG];
+
+	if (!cfg_cl || !cfg_cl->chan)
+		return;
+
+	cmdq_set_event(cfg_cl->chan,
+		       mtk_crtc->gce_obj.event[EVENT_STREAM_BLOCK]);
+	cmdq_clear_event(cfg_cl->chan,
+			 mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
+	cmdq_set_event(cfg_cl->chan,
+		       mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
+	cmdq_set_event(cfg_cl->chan,
+		       mtk_crtc->gce_obj.event[EVENT_ESD_EOF]);
+	cmdq_set_event(cfg_cl->chan,
+		       mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
+	cmdq_clear_event(cfg_cl->chan,
+			 mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
+	cmdq_set_event(cfg_cl->chan,
+		       mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
+	DDPPR_ERR("MTKDBG FORCE_EVENT seof=%u dirty=%u\n",
+		  cmdq_get_event(cfg_cl->chan,
+				 mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]),
+		  cmdq_get_event(cfg_cl->chan,
+				 mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]));
+}
+
+/* Complete a wedged frame: after an IOMMU fault the RDMA stalls mid-read,
+ * DSI never finishes the transfer and the trig loop parks on
+ * wfe(CMD_EOF=DSI0_FRAME_DONE) forever - EOF is never set and the CFG
+ * thread deadlocks on wait(641) (v211 log: fault at 132.45s, log-only
+ * handler, frame still wedged -> created frozen at 3733). Clearing and
+ * re-setting the frame-done token lets the parked loop finish this frame
+ * and cycle on; the timeout path has already reset the DSI when this is
+ * called from there. Only used on a CONFIRMED wedge (fault ISR / cmdq
+ * timeout), never at boot - poking CMD_EOF while the DSI initializes
+ * desyncs it (v209 regression). */
+static void mtk_crtc_complete_faulted_frame(struct drm_crtc *crtc)
+{
+	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct cmdq_client *cfg_cl = mtk_crtc->gce_obj.client[CLIENT_CFG];
+
+	if (!cfg_cl || !cfg_cl->chan)
+		return;
+	cmdq_clear_event(cfg_cl->chan,
+			 mtk_crtc->gce_obj.event[EVENT_CMD_EOF]);
+	cmdq_set_event(cfg_cl->chan,
+		       mtk_crtc->gce_obj.event[EVENT_CMD_EOF]);
+	cmdq_clear_event(cfg_cl->chan,
+			 mtk_crtc->gce_obj.event[EVENT_VDO_EOF]);
+	cmdq_set_event(cfg_cl->chan,
+		       mtk_crtc->gce_obj.event[EVENT_VDO_EOF]);
+	cmdq_clear_event(cfg_cl->chan,
+			 mtk_crtc->gce_obj.event[EVENT_RDMA0_EOF]);
+	cmdq_set_event(cfg_cl->chan,
+		       mtk_crtc->gce_obj.event[EVENT_RDMA0_EOF]);
+	DDPPR_ERR("MTKDBG COMPLETE_FRAME cmdeof=%u\n",
+		  cmdq_get_event(cfg_cl->chan,
+				 mtk_crtc->gce_obj.event[EVENT_CMD_EOF]));
+}
+
+/* Wake-up pulse for the PM resume path: the screen-off cycle leaves a
+ * commit pkt parked on wait(STREAM_EOF=641) on the CFG thread (loop
+ * stopped mid-frame, edge missed), and mtk_crtc_set_dirty queues behind
+ * it - circular deadlock (proven by v208/v209 Pre-dumps: "wait for event
+ * 641 become 1 value:0"). The fresh loop restarted at wake parks on
+ * wfe(DIRTY), so a clear+set DIRTY edge makes it run one frame, set EOF
+ * and drain the parked CFG pkt. Called from mtk_drm_sys_resume only -
+ * never from the boot/first-enable path (pulsing CMD_EOF there desyncs
+ * the DSI and freezes the panel, v209 regression). */
+void mtk_drm_crtc_wakeup_pulse(void)
+{
+	extern struct mtk_drm_private *g_mtk_private;
+	struct mtk_drm_private *private = g_mtk_private;
+
+	if (!private || !private->crtc[0])
+		return;
+	if (!mtk_crtc_with_trigger_loop(private->crtc[0]))
+		return;
+	mtk_crtc_force_set_stream_events(private->crtc[0]);
+}
+EXPORT_SYMBOL(mtk_drm_crtc_wakeup_pulse);
 
 static void mtk_crtc_rec_trig_cnt(struct mtk_drm_crtc *mtk_crtc,
 				  struct cmdq_pkt *cmdq_handle)
@@ -3164,7 +3758,19 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 	struct cmdq_pkt *cmdq_handle;
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	unsigned long crtc_id = (unsigned long)drm_crtc_index(crtc);
-	struct mtk_drm_private *priv = crtc->dev->dev_private;
+
+	DDPPR_ERR("MTKDBG START_TRIG_LOOP crtc=%ld\n", crtc_id);
+
+	/* Guard against double start: the loop can be (re)started from
+	 * crtc enable, from atomic_flush on a screen-on frame, or from the
+	 * DSI encoder enable - only the first one may create the pkt,
+	 * otherwise two loops run on GCE at once and double-trigger DSI
+	 * (display corruption / splash artifacts).
+	 */
+	if (mtk_crtc->trig_loop_cmdq_handle) {
+		DDPPR_ERR("MTKDBG START_TRIG_LOOP skip (running)\n");
+		return;
+	}
 #if defined(CONFIG_MACH_MT6873) || defined(CONFIG_MACH_MT6853) || \
 	defined(CONFIG_MACH_MT6833)
 	struct cmdq_operand lop, rop;
@@ -3193,34 +3799,54 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 	cmdq_handle = mtk_crtc->trig_loop_cmdq_handle;
 
 	if (mtk_crtc_is_frame_trigger_mode(crtc)) {
+		/* A12 trig loop, instruction-for-instruction (reversed from
+		 * kernel.elf mtk_crtc_start_trig_loop @0xffffff800884c938):
+		 *
+		 *   wait_no_clear(STREAM_BLOCK)   - BLOCK set by hw_block_ready
+		 *                                    on enable, only cleared by
+		 *                                    crtc_stop / dsi_disable
+		 *   wfe(STREAM_DIRTY)             - frame gate: set by gce_flush
+		 *                                    at the END of each commit pkt,
+		 *                                    so the loop only triggers
+		 *                                    after the layer config is done
+		 *   clear(STREAM_EOF)             - EOF is re-set by the loop
+		 *                                    itself at the end of the frame
+		 *   wait_no_clear(ESD_EOF/CABC_EOF) - status flags, set by
+		 *                                    clear_wait_event/backlight,
+		 *                                    never cleared -> pass-through
+		 *   clear(TE), [lcm] wfe(TE)      - hardware TE sync
+		 *   clear(STREAM_DIRTY), wait_no_clear(CABC/ESD)
+		 *   mutex_enable_cmdq, comp_trigger, wfe(CMD_EOF=57)
+		 *   LAYER_REC, set(STREAM_EOF)
+		 *
+		 * The loop parks on wfe(STREAM_DIRTY) when no frame is being
+		 * committed - it does NOT run every TE. With no commit there
+		 * is nothing to trigger, and an empty trigger is what left DSI
+		 * BUSY stuck (greq=0, FRAME_DONE never fires, screen frozen).
+		 */
+		cmdq_pkt_wait_no_clear(cmdq_handle,
+			mtk_crtc->gce_obj.event[EVENT_STREAM_BLOCK]);
 		cmdq_pkt_wfe(cmdq_handle,
 			     mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
-#ifndef CONFIG_FPGA_EARLY_PORTING
 		cmdq_pkt_clear_event(cmdq_handle,
-				     mtk_crtc->gce_obj.event[EVENT_TE]);
+			mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
+		cmdq_pkt_wait_no_clear(cmdq_handle,
+			mtk_crtc->gce_obj.event[EVENT_ESD_EOF]);
+		cmdq_pkt_wait_no_clear(cmdq_handle,
+			mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
+		cmdq_pkt_clear_event(cmdq_handle,
+			mtk_crtc->gce_obj.event[EVENT_TE]);
 
 		if (mtk_drm_lcm_is_connect())
 			cmdq_pkt_wfe(cmdq_handle,
-					 mtk_crtc->gce_obj.event[EVENT_TE]);
+				     mtk_crtc->gce_obj.event[EVENT_TE]);
 
-		/* The STREAM BLOCK EVENT is used for stopping frame trigger if
-		 * the engine is stopped
-		 */
-		cmdq_pkt_wait_no_clear(
-			cmdq_handle,
-			mtk_crtc->gce_obj.event[EVENT_STREAM_BLOCK]);
-#endif
 		cmdq_pkt_clear_event(cmdq_handle,
-				     mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
-		cmdq_pkt_clear_event(
-			cmdq_handle,
 			mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
-#ifndef CONFIG_FPGA_EARLY_PORTING
 		cmdq_pkt_wait_no_clear(cmdq_handle,
-				     mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
+			mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
 		cmdq_pkt_wait_no_clear(cmdq_handle,
-				       mtk_crtc->gce_obj.event[EVENT_ESD_EOF]);
-#endif
+			mtk_crtc->gce_obj.event[EVENT_ESD_EOF]);
 
 		/*Trigger*/
 		mtk_disp_mutex_enable_cmdq(mtk_crtc->mutex[0], cmdq_handle,
@@ -3230,10 +3856,9 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 
 		cmdq_pkt_wfe(cmdq_handle,
 			     mtk_crtc->gce_obj.event[EVENT_CMD_EOF]);
-		mtk_crtc_comp_trigger(mtk_crtc, cmdq_handle, MTK_TRIG_FLAG_EOF);
+		/* A12: no EOF trigger after CMD_EOF; LAYER_REC only */
 
-		if (mtk_drm_helper_get_opt(priv->helper_opt,
-					   MTK_DRM_OPT_LAYER_REC)) {
+		if (mtk_crtc_dsi0_in_path(mtk_crtc)) {
 			mtk_crtc_comp_trigger(mtk_crtc, cmdq_handle,
 					      MTK_TRIG_FLAG_LAYER_REC);
 
@@ -3278,8 +3903,7 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 			mtk_crtc->gce_obj.event[EVENT_SYNC_TOKEN_SODI]);
 #endif
 
-		if (mtk_drm_helper_get_opt(priv->helper_opt,
-					   MTK_DRM_OPT_LAYER_REC)) {
+		if (mtk_crtc_dsi0_in_path(mtk_crtc)) {
 			cmdq_pkt_clear_event(cmdq_handle,
 				mtk_crtc->gce_obj.event[EVENT_RDMA0_EOF]);
 			cmdq_pkt_clear_event(cmdq_handle,
@@ -3297,13 +3921,13 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 			mtk_crtc->layer_rec_en = true;
 		} else {
 			mtk_crtc->layer_rec_en = false;
+			}
 		}
-	}
-	cmdq_pkt_finalize_loop(cmdq_handle);
-	ret = cmdq_pkt_flush_async(cmdq_handle, trig_done_cb, (void *)crtc_id);
+		cmdq_pkt_finalize_loop(cmdq_handle);
+		ret = cmdq_pkt_flush_async(cmdq_handle, trig_done_cb, (void *)crtc_id);
 
-	mtk_crtc_clear_wait_event(crtc);
-}
+		mtk_crtc_clear_wait_event(crtc);
+	}
 
 void mtk_crtc_hw_block_ready(struct drm_crtc *crtc)
 {
@@ -3322,9 +3946,31 @@ void mtk_crtc_hw_block_ready(struct drm_crtc *crtc)
 void mtk_crtc_stop_trig_loop(struct drm_crtc *crtc)
 {
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct cmdq_client *cfg_cl;
+
+	DDPPR_ERR("MTKDBG STOP_TRIG_LOOP crtc=%d handle=%p\n",
+		  drm_crtc_index(crtc), mtk_crtc->trig_loop_cmdq_handle);
+	/* The loop may already be stopped (atomic_flush BLANK frame + DSI
+	 * encoder disable can both run stop on the same screen-off) -
+	 * destroying a NULL pkt dereferences it.
+	 */
+	if (!mtk_crtc->trig_loop_cmdq_handle)
+		return;
+
+	/* cmdq_mbox_stop() drops the last GCE clock reference
+	 * (cmdq_clk_disable in cmdq_mbox_thread_stop), which halts every
+	 * GCE thread - including CLIENT_CFG whose pkt is then stuck forever
+	 * (seen as err=-110 + CFG_THREAD pc parked on a set_event). Keep
+	 * the clock on, exactly like the A11 doze-switch path does before
+	 * mtk_crtc_stop_trig_loop (cmdq_mbox_enable "GCE clk refcnt + 1").
+	 */
+	cfg_cl = mtk_crtc->gce_obj.client[CLIENT_CFG];
+	if (cfg_cl && cfg_cl->chan)
+		cmdq_mbox_enable(cfg_cl->chan);
 
 	cmdq_mbox_stop(mtk_crtc->gce_obj.client[CLIENT_TRIG_LOOP]);
 	cmdq_pkt_destroy(mtk_crtc->trig_loop_cmdq_handle);
+	mtk_crtc->trig_loop_cmdq_handle = NULL;
 }
 
 /* sw workaround to fix gce hw bug */
@@ -3630,6 +4276,30 @@ void mtk_crtc_restore_plane_setting(struct mtk_drm_crtc *mtk_crtc)
 		struct mtk_plane_state *plane_state;
 
 		plane_state = to_mtk_plane_state(plane->state);
+		/* A12 vendor SF: on blank (mtk_drm_crtc_suspend) the layer
+		 * buffers are released once the present fence signals, while
+		 * the display stays off - so the pre-suspend addresses kept in
+		 * plane->state are stale by the time atomic_resume runs.
+		 * Writing them back into OVL makes RDMA read freed memory:
+		 * IOMMU fault (L0_OVL_RDMA0_HDR, larb=0 port=2) and the whole
+		 * pipeline stalls (no frame -> trig loop WFE timeout -> screen
+		 * never wakes on power key). Clear addr but keep enable=1 so
+		 * the restored layer comes up as constant color (CON bit28,
+		 * no memory read) and keeps producing frames until SF's first
+		 * post-resume commit feeds fresh buffers via layer_config. */
+		plane_state->pending.addr = 0;
+		DDPPR_ERR("%s+ idx:%d clear stale addr (enable=%d)\n",
+			__func__, i, plane_state->pending.enable);
+		/* addr=0 layers must not be handed to layer_config at all:
+		 * the AFBC path still computes HDR_ADDR = 0 + header_offset
+		 * (0x28000) and OVL reads it even in constant-color mode ->
+		 * IOMMU_FAULT iova=0x28000 -> fault-recovery loop. Leave the
+		 * layer off; SF's first post-resume commit re-enables it. */
+		if (!plane_state->pending.addr) {
+			DDPPR_ERR("%s+ idx:%d skip zero-addr layer\n",
+				__func__, i);
+			continue;
+		}
 		if (i >= OVL_PHY_LAYER_NR && !plane_state->comp_state.comp_id)
 			continue;
 		if (plane_state->comp_state.comp_id)
@@ -3973,24 +4643,6 @@ void mtk_crtc_config_default_path(struct mtk_drm_crtc *mtk_crtc)
 	cmdq_pkt_destroy(cmdq_handle);
 }
 
-static void mtk_crtc_all_layer_off(struct mtk_drm_crtc *mtk_crtc,
-				   struct cmdq_pkt *cmdq_handle)
-{
-	int i, j, keep_first_layer;
-	struct mtk_ddp_comp *comp;
-
-	keep_first_layer = true;
-	for_each_comp_in_cur_crtc_path(comp, mtk_crtc, i, j)
-		mtk_ddp_comp_io_cmd(comp, cmdq_handle,
-			OVL_ALL_LAYER_OFF, &keep_first_layer);
-	
-	if (mtk_crtc->is_dual_pipe) {
-		for_each_comp_in_dual_pipe(comp, mtk_crtc, i, j)
-			mtk_ddp_comp_io_cmd(comp, cmdq_handle,
-				OVL_ALL_LAYER_OFF, &keep_first_layer);
-	}
-}
-
 void mtk_crtc_stop_ddp(struct mtk_drm_crtc *mtk_crtc,
 		       struct cmdq_pkt *cmdq_handle)
 {
@@ -4047,10 +4699,16 @@ void mtk_crtc_stop(struct mtk_drm_crtc *mtk_crtc, bool need_wait)
 		if (gce_event > 0)
 			cmdq_pkt_wait_no_clear(cmdq_handle, gce_event);
 	} else if (mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
-		/* 1. wait stream eof & clear tocken */
-		/* clear eof token to prevent any config after this command */
+		/* 1. announce stream eof & clear tocken */
+		/* A12 (mtk_crtc_stop @0xffffff8008854f2c): wfe(STREAM_EOF) -
+		 * wait for the trig loop to finish the current frame, then
+		 * clear STREAM_BLOCK so the loop (stopped right after this
+		 * pkt) cannot restart. EOF is kept set by the loop between
+		 * frames (it only drops during the loop's own clear + re-set
+		 * window), so this wfe passes unless the loop is actually
+		 * mid-frame; stop_trig_loop runs after this pkt flushes. */
 		cmdq_pkt_wfe(cmdq_handle,
-				 mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
+			     mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
 
 		/* clear dirty token to prevent trigger loop start */
 		cmdq_pkt_clear_event(
@@ -4203,21 +4861,32 @@ void mtk_drm_crtc_enable(struct drm_crtc *crtc)
 		mtk_crtc_start_trig_loop(crtc);
 	}
 
+	/* A12 (mtk_drm_crtc_enable @0x8855b2c): set(get_path_wait_event())
+	 * only for dual-path (ddp_comp_nr[DDP_SECOND_PATH] != 0) - the
+	 * single-path cezanne skips it, so the commit's wait_no_clear(EOF)
+	 * syncs on the loop's own set(EOF) from the previous frame instead
+	 * of being pre-armed (pre-arming lets the commit pass before the
+	 * loop is actually ready on resume). */
+	if (drm_crtc_index(crtc) <= 1 &&
+	    mtk_crtc->ddp_ctx[mtk_crtc->ddp_mode].ddp_comp_nr[DDP_SECOND_PATH]) {
+		int gce_event =
+			get_path_wait_event(mtk_crtc, mtk_crtc->ddp_mode);
+		struct cmdq_pkt *cmdq_handle;
+
+		if (gce_event > 0) {
+			mtk_crtc_pkt_create(&cmdq_handle, crtc,
+				mtk_crtc->gce_obj.client[CLIENT_CFG]);
+			cmdq_pkt_set_event(cmdq_handle, gce_event);
+			cmdq_pkt_flush(cmdq_handle);
+			cmdq_pkt_destroy(cmdq_handle);
+		}
+	}
+
 	if (mtk_crtc_is_mem_mode(crtc) || mtk_crtc_is_dc_mode(crtc)) {
 		struct golden_setting_context *ctx =
 					__get_golden_setting_context(mtk_crtc);
-		struct cmdq_pkt *cmdq_handle;
-		int gce_event =
-			get_path_wait_event(mtk_crtc, mtk_crtc->ddp_mode);
 
 		ctx->is_dc = 1;
-
-		cmdq_handle =
-			cmdq_pkt_create(mtk_crtc->gce_obj.client[CLIENT_CFG]);
-		if (gce_event > 0)
-			cmdq_pkt_set_event(cmdq_handle, gce_event);
-		cmdq_pkt_flush(cmdq_handle);
-		cmdq_pkt_destroy(cmdq_handle);
 	}
 
 	CRTC_MMP_MARK(crtc_id, enable, 1, 2);
@@ -4246,9 +4915,19 @@ void mtk_drm_crtc_enable(struct drm_crtc *crtc)
 			mtk_disp_set_hrt_bw(mtk_crtc, mtk_crtc->qos_ctx->last_hrt_req);
 #endif
 
-	/* 10. set dirty for cmd mode */
+	/* 10. set dirty for cmd mode - A12 (mtk_drm_crtc_enable @0x8855760)
+	 * also requires HBM_ENABLE and MSYNC2_0_ENABLE to be clear. On
+	 * resume a set_dirty here wakes the trig loop into an EMPTY
+	 * trigger before the first SF commit re-feeds the layers with
+	 * valid buffers - the restored (pre-suspend) layer addresses can
+	 * be stale, so the OVL/RDMA data path dies (RDMA counters 0, DSI
+	 * BUSY, screen stays black while the system reports "screen on").
+	 * A12 skips the wake when those flags are set; the loop then waits
+	 * for the first commit's STREAM_DIRTY with fresh layer config. */
 	if (mtk_crtc_is_frame_trigger_mode(crtc) &&
-		!mtk_state->prop_val[CRTC_PROP_DOZE_ACTIVE])
+		!mtk_state->prop_val[CRTC_PROP_DOZE_ACTIVE] &&
+		!mtk_state->prop_val[CRTC_PROP_HBM_ENABLE] &&
+		!mtk_state->prop_val[CRTC_PROP_MSYNC2_0_ENABLE])
 		mtk_crtc_set_dirty(mtk_crtc);
 
 	/* 11. set vblank*/
@@ -4549,9 +5228,18 @@ void mtk_crtc_first_enable_ddp_config(struct mtk_drm_crtc *mtk_crtc)
 			     mtk_crtc->gce_obj.event[EVENT_VDO_EOF]);
 	mtk_crtc_wait_frame_done(mtk_crtc, cmdq_handle, DDP_FIRST_PATH, 0);
 
-	/*1. Show LK logo only */
-	mtk_crtc_all_layer_off(mtk_crtc, cmdq_handle);
-
+	/*1. Keep the LK logo layers (A12 mtk_crtc_first_enable_ddp_config
+	 * has no all_layer_off - reversed from kernel.elf @0x-7ff77a9128).
+	 * The old code turned every layer + its layer RDMA off here, so the
+	 * first set(STREAM_DIRTY) (enable's "set dirty for cmd mode" or the
+	 * backlight's check_trigger) woke the trig loop into an EMPTY
+	 * trigger: no layer RDMA -> OVL produced nothing -> DSI waited for
+	 * data forever -> FRAME_DONE(57) never fired -> loop deadlocked ->
+	 * screen stuck on the LK splash (the "second logo never shows"
+	 * bug). A12 keeps the LK layers (addresses are re-pointed at the
+	 * DRM fbdev mva right below), so an early trigger still has a data
+	 * path and 57 fires; the first SF commit then takes the layers over.
+	 */
 /*2. Load Round Corner */
 #ifdef CONFIG_MTK_ROUND_CORNER_SUPPORT
 	mtk_crtc_load_round_corner_pattern(&mtk_crtc->base, cmdq_handle);
@@ -4580,8 +5268,12 @@ void mtk_crtc_first_enable_ddp_config(struct mtk_drm_crtc *mtk_crtc)
 	cmdq_pkt_flush(cmdq_handle);
 	cmdq_pkt_destroy(cmdq_handle);
 
-	if (mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base))
-		mtk_crtc_set_dirty(mtk_crtc);
+	/* A12 first_enable ends here: it only sets STREAM_EOF (already set
+	 * by mtk_crtc_clear_wait_event at loop start), it does NOT call
+	 * set_dirty - setting DIRTY here wakes the trig loop before any
+	 * commit, and with the old all_layer_off that meant an empty
+	 * trigger with no data path (see above).
+	 */
 }
 
 void mtk_drm_crtc_first_enable(struct drm_crtc *crtc)
@@ -4785,6 +5477,10 @@ void mtk_drm_crtc_suspend(struct drm_crtc *crtc)
 	CRTC_MMP_EVENT_START(index, suspend,
 			mtk_crtc->enabled, 0);
 
+	/* MTKDBG v190: new blank cycle - drop the fault blacklist so
+	 * buffers re-mapped by the SF for the next cycle are not skipped. */
+	mtk_drm_fault_blacklist_clear();
+
 	mtk_drm_crtc_wait_blank(mtk_crtc);
 
 /* disable engine secure state */
@@ -4909,7 +5605,18 @@ struct cmdq_pkt *mtk_crtc_gce_commit_begin(struct drm_crtc *crtc)
 		mtk_crtc_pkt_create(&cmdq_handle, crtc,
 			mtk_crtc->gce_obj.client[CLIENT_CFG]);
 
-	mtk_crtc_wait_frame_done(mtk_crtc, cmdq_handle, DDP_FIRST_PATH, 0);
+	/* A12 (mtk_crtc_gce_commit_begin calls mtk_crtc_wait_frame_done,
+	 * which for the DSI0 path in trigger mode appends
+	 * wait_no_clear(STREAM_EOF)): wait for the trig loop to finish the
+	 * previous frame. STREAM_EOF is a level flag - the loop sets it at
+	 * the end of every frame and only the loop's own clear(641) (or
+	 * crtc_stop's wfe) drops it, so this check passes instantly unless
+	 * the loop is mid-frame; that is the commit backpressure. A set()
+	 * here (old code) skipped the sync entirely and a wfe() would have
+	 * deadlocked the old loop which parked on wfe(57) with EOF stale.
+	 */
+	cmdq_pkt_wait_no_clear(cmdq_handle,
+		mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
 
 	if (mtk_crtc->sec_on) {
 	#if defined(CONFIG_MTK_SEC_VIDEO_PATH_SUPPORT)
@@ -5127,6 +5834,44 @@ void mtk_drm_crtc_plane_update(struct drm_crtc *crtc, struct drm_plane *plane,
 		DDPINFO("%s+ comp_id:%d, comp_id:%d\n", __func__, comp->id,
 		    plane_state->comp_state.comp_id);
 
+	/* Set the crtc to plane state unconditionally (A12 does this in
+	 * its plane_update path too). Without this, when the HWC layer
+	 * blob is missing the crtc field stays NULL and mtk_plane_
+	 * atomic_disable skips the whole update - so suspend never
+	 * layer_offs the OVL and the stale layer address (already
+	 * released by SF) is read on resume -> iommu fault -> black
+	 * screen while the pipeline keeps running.
+	 */
+	plane_state->crtc = crtc;
+
+	/* A12: when the HWC layer blob is missing (comp_state == 0),
+	 * assign comp by plane index - OVL0_2L takes the first 2
+	 * layers, OVL0 the next 4 - so layers land on a valid OVL
+	 * and the pipeline keeps producing frames (DSI FRAME_DONE
+	 * keeps coming, the trig loop does not stall). Without this,
+	 * every frame goes to the fallback comp (OVL0_2L) with the
+	 * raw plane index as layer id, which breaks the layer config
+	 * (esp. dual-pipe path) and a screen-off black frame leaves
+	 * the OVLs without valid layers -> no FRAME_DONE -> wfe(57)
+	 * stall -> display freeze.
+	 */
+	if (plane_state->comp_state.comp_id == 0) {
+		struct mtk_ddp_comp *ovl2l =
+			priv->ddp_comp[DDP_COMPONENT_OVL0_2L];
+		int lnr = ovl2l ? mtk_ovl_layer_num(ovl2l) : 2;
+
+		if (plane_index < lnr) {
+			plane_state->comp_state.comp_id =
+				DDP_COMPONENT_OVL0_2L;
+			plane_state->comp_state.lye_id = plane_index;
+		} else {
+			plane_state->comp_state.comp_id =
+				DDP_COMPONENT_OVL0;
+			plane_state->comp_state.lye_id = plane_index - lnr;
+		}
+		plane_state->comp_state.ext_lye_id = LYE_NORMAL;
+	}
+
 	if (plane_state->pending.enable) {
 		if (mtk_crtc->is_dual_pipe) {
 			struct mtk_plane_state plane_state_l;
@@ -5168,10 +5913,17 @@ void mtk_drm_crtc_plane_update(struct drm_crtc *crtc, struct drm_plane *plane,
 #else
 		mtk_wb_atomic_commit(mtk_crtc);
 #endif
-	} else if (state->prop_val[CRTC_PROP_USER_SCEN] &
-		USER_SCEN_BLANK) {
-	/* plane disable at mtk_crtc_get_plane_comp_state() actually */
-	/* following statement is for disable all layers during suspend */
+	} else {
+	/* A12 gates this path on USER_SCEN_BLANK, but with plane_state->crtc
+	 * now set unconditionally (see above) mtk_plane_atomic_disable
+	 * actually reaches this code on every page switch / layer teardown.
+	 * Skipping the layer_off here leaves the OVL layer enabled with a
+	 * stale address, while the fence handling below signals the release
+	 * fence and SF frees the buffer - the HW then reads the freed
+	 * buffer -> iommu fault + continuous OVL0_2L/OVL1_2L underflow.
+	 * So unconditionally layer_off a disabled layer (layer_config with
+	 * enable=0 performs mtk_ovl_layer_off, same as the blanking path).
+	 */
 
 		if (mtk_crtc->is_dual_pipe) {
 			struct mtk_plane_state plane_state_l;
@@ -5540,9 +6292,18 @@ int mtk_crtc_gce_flush(struct drm_crtc *crtc, void *gce_cb,
 		cmdq_pkt_wait_no_clear(cmdq_handle, gce_event);
 	} else if (mtk_crtc_is_frame_trigger_mode(crtc) &&
 					mtk_crtc_with_trigger_loop(crtc)) {
-		/* DL with trigger loop */
+		/* A12 (mtk_crtc_gce_flush @0xffffff800885af38): set
+		 * STREAM_DIRTY at the END of the pkt, right before flush, so
+		 * the trig loop's wfe(640) only passes once the whole layer
+		 * config of this commit has executed. Setting it at the pkt
+		 * head lets the loop trigger before the data is ready -> DSI
+		 * starts a transfer with no data -> BUSY stuck, FRAME_DONE(57)
+		 * never fires, screen freezes (the "second logo never shows"
+		 * bug). This is the loop's frame gate: with no commits the
+		 * loop parks on wfe(640) and does nothing.
+		 */
 		cmdq_pkt_set_event(cmdq_handle,
-				mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
+			mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
 
 	} else {
 		/* DL without trigger loop */
@@ -6019,7 +6780,7 @@ static void mtk_drm_crtc_atomic_flush(struct drm_crtc *crtc,
 	}
 
 	/* backup sf present fence */
-	if (state->prop_val[CRTC_PROP_SF_PRES_FENCE_IDX] != (unsigned int)-1) {
+	if (state->prop_val[CRTC_PROP_SF_PRESENT_FENCE] != (unsigned int)-1) {
 		struct cmdq_pkt_buffer *cmdq_buf = &(mtk_crtc->gce_obj.buf);
 		dma_addr_t addr =
 			cmdq_buf->pa_base +
@@ -6027,15 +6788,26 @@ static void mtk_drm_crtc_atomic_flush(struct drm_crtc *crtc,
 
 		cmdq_pkt_write(cmdq_handle,
 			mtk_crtc->gce_obj.base, addr,
-			state->prop_val[CRTC_PROP_SF_PRES_FENCE_IDX], ~0);
+			state->prop_val[CRTC_PROP_SF_PRESENT_FENCE], ~0);
 		CRTC_MMP_MARK(index, update_sf_present_fence, 0,
-			state->prop_val[CRTC_PROP_SF_PRES_FENCE_IDX]);
+			state->prop_val[CRTC_PROP_SF_PRESENT_FENCE]);
 	}
 
 	atomic_set(&mtk_crtc->delayed_trig, 1);
 	cb_data->state = old_crtc_state;
 	cb_data->cmdq_handle = cmdq_handle;
 	cb_data->misc = mtk_crtc->ddp_mode;
+
+	/* Keep the trig loop alive across screen-off (A12 keeps it running,
+	 * DSI keeps refreshing so BUSY is only transient and the panel-off
+	 * commands succeed). Revive it here whenever it stalled - the loop
+	 * can park on wfe(57)/wfe(TE) during a black frame and never wake
+	 * without this per-frame check.
+	 */
+	if (index == 0 && mtk_crtc_with_trigger_loop(crtc) &&
+	    !(state->prop_val[CRTC_PROP_USER_SCEN] & USER_SCEN_BLANK) &&
+	    !mtk_crtc->trig_loop_cmdq_handle)
+		mtk_crtc_start_trig_loop(crtc);
 
 	mtk_drm_crtc_hbm_fence(crtc, state, priv, false, &delay_flag, &hbm_changed);
 
@@ -6085,7 +6857,7 @@ static void mtk_drm_crtc_atomic_flush(struct drm_crtc *crtc,
 
 end:
 	CRTC_MMP_EVENT_END(index, atomic_flush, (unsigned long)crtc_state,
-			(unsigned long)old_crtc_state);
+				(unsigned long)old_crtc_state);
 	mtk_drm_trace_end();
 }
 
@@ -6143,7 +6915,8 @@ static void mtk_drm_crtc_attach_property(struct drm_crtc *crtc)
 	for (i = 0; i < CRTC_PROP_MAX; i++) {
 		prop = private->crtc_property[index][i];
 		crtc_prop = &(mtk_crtc_property[i]);
-		DDPINFO("%s:%d prop:%p\n", __func__, __LINE__, prop);
+		DDPPR_ERR("MTKDBG attach crtc:%d prop[%d] name:%s\n",
+			  index, i, crtc_prop->name);
 		if (!prop) {
 			prop = mtk_crtc_prop[i];
 		      private
@@ -6195,8 +6968,13 @@ void mtk_crtc_vblank_irq(struct drm_crtc *crtc)
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	char tag_name[100] = {'\0'};
 	ktime_t ktime = ktime_get();
+	static unsigned int vblank_cnt;
 
 	mtk_crtc->vblank_time = ktime_to_timeval(ktime);
+
+	if (++vblank_cnt % 60 == 1)
+		DDPPR_ERR("MTKDBG VBLANK crtc=%d cnt=%u\n",
+			  drm_crtc_index(crtc), vblank_cnt);
 
 	sprintf(tag_name, "%d|HW_VSYNC|%lld",
 		DRM_TRACE_VSYNC_ID, ktime);
@@ -6524,6 +7302,17 @@ static int mtk_drm_pf_release_thread(void *data)
 		cmdq_buf = &(mtk_crtc->gce_obj.buf);
 		fence_idx = *(unsigned int *)(cmdq_buf->va_base +
 				DISP_SLOT_PRESENT_FENCE(crtc_idx));
+
+		/* v207: record for the stall watchdog; log one line when the
+		 * slot skipped an idx (a lost fence - SF waits forever on it
+		 * and the framework watchdog kills system_server). */
+		if (g_pf_released_valid[crtc_idx] &&
+		    fence_idx > g_pf_released[crtc_idx] + 1)
+			pr_notice("MTKDBG FENCE_GAP crtc=%d last=%u now=%u\n",
+				  crtc_idx, g_pf_released[crtc_idx],
+				  fence_idx);
+		g_pf_released[crtc_idx] = fence_idx;
+		g_pf_released_valid[crtc_idx] = 1;
 
 		mtk_release_present_fence(private->session_id[crtc_idx],
 					  fence_idx);
@@ -6866,6 +7655,12 @@ int mtk_drm_crtc_create(struct drm_device *drm_dev,
 	mtk_crtc->sf_pf_release_thread =
 				kthread_run(mtk_drm_sf_pf_release_thread,
 					    mtk_crtc, "sf_pf_release_thread");
+
+	/* v207: present-fence stall watchdog (every 2s while the driver
+	 * lives; self-re-arms). */
+	if (!delayed_work_pending(&g_pf_watchdog_work))
+		schedule_delayed_work(&g_pf_watchdog_work,
+				      msecs_to_jiffies(2000));
 
 	/* init wakelock resources */
 	{
@@ -8501,10 +9296,16 @@ void mtk_crtc_stop_for_pm(struct mtk_drm_crtc *mtk_crtc, bool need_wait)
 		cmdq_pkt_wait_no_clear(cmdq_handle,
 				 mtk_crtc->gce_obj.event[EVENT_WDMA0_EOF]);
 	} else if (mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
-		/* 1. wait stream eof & clear tocken */
-		/* clear eof token to prevent any config after this command */
+		/* 1. announce stream eof & clear tocken */
+		/* A12 (mtk_crtc_stop @0xffffff8008854f2c): wfe(STREAM_EOF) -
+		 * wait for the trig loop to finish the current frame, then
+		 * clear STREAM_BLOCK so the loop (stopped right after this
+		 * pkt) cannot restart. EOF is kept set by the loop between
+		 * frames (it only drops during the loop's own clear + re-set
+		 * window), so this wfe passes unless the loop is actually
+		 * mid-frame; stop_trig_loop runs after this pkt flushes. */
 		cmdq_pkt_wfe(cmdq_handle,
-				 mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
+			     mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
 
 		/* clear dirty token to prevent trigger loop start */
 		cmdq_pkt_clear_event(

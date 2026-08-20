@@ -230,9 +230,37 @@ static ssize_t monitor_hang_read(struct file *filp, char __user *buf,
 static ssize_t monitor_hang_write(struct file *filp, const char __user *buf,
 		size_t count, loff_t *f_pos)
 {
+	char local[8] = {0};
 
-	/* LOGV("%s\n", __func__); */
-	return 0;
+	/* Ported from A12 kernel (monitor_hang_write$...):
+	 * init writes "1"/"0" to /dev/RT_Monitor to control hang detect.
+	 * Must return count (not 0) or init's write loop spins forever. */
+	if (count >= 3) {
+		pr_info("hang_detect: invalid input\n");
+		return -EINVAL;
+	}
+	if (!buf) {
+		pr_info("hang_detect: invalid user buf\n");
+		return -EINVAL;
+	}
+	if (copy_from_user(local, buf, count)) {
+		pr_info("hang_detect: failed to copy from user\n");
+		return -EFAULT;
+	}
+	if (strncmp(current->comm, "init", 4)) {
+		pr_info("hang_detect: invalid user buf\n");
+		return -EINVAL;
+	}
+	if (local[0] == '1') {
+		pr_info("hang_detect: enable by start cmd\n");
+		aee_kernel_RT_Monitor_api(1);
+	} else if (local[0] == '0') {
+		pr_info("hang_detect: disable by stop cmd\n");
+		aee_kernel_RT_Monitor_api(0);
+	} else {
+		pr_info("hang_detect: invalid control msg\n");
+	}
+	return count;
 }
 
 

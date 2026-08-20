@@ -355,6 +355,12 @@ int drm_mode_obj_get_properties_ioctl(struct drm_device *dev, void *data,
 	struct drm_mode_object *obj;
 	int ret = 0;
 
+	/* [DRM-DBG] who queries object properties and what happens */
+	if (!strncmp(current->comm, "composer@2.3-se", 15) ||
+	    !strncmp(current->comm, "surfaceflinger", 14))
+		pr_err("[DRM-DBG] GETPROPERTIES obj_id=%u obj_type=%u atomic=%d\n",
+		       arg->obj_id, arg->obj_type, file_priv->atomic);
+
 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
 		return -EINVAL;
 
@@ -374,6 +380,11 @@ int drm_mode_obj_get_properties_ioctl(struct drm_device *dev, void *data,
 			(uint32_t __user *)(unsigned long)(arg->props_ptr),
 			(uint64_t __user *)(unsigned long)(arg->prop_values_ptr),
 			&arg->count_props);
+
+	if (!strncmp(current->comm, "composer@2.3-se", 15) ||
+	    !strncmp(current->comm, "surfaceflinger", 14))
+		pr_err("[DRM-DBG] GETPROPERTIES obj=%u -> ret=%d count=%u\n",
+		       arg->obj_id, ret, arg->count_props);
 
 out_unref:
 	drm_mode_object_put(obj);

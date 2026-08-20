@@ -311,19 +311,26 @@ static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
 					   1);
 		}
 		mtk_drm_refresh_tag_end(&priv->ddp_comp);
-	}
 
-	if (val & (1 << 1)) {
-		DDPIRQ("[IRQ] %s: frame start!\n", mtk_dump_comp_str(rdma));
-		mtk_drm_refresh_tag_start(&priv->ddp_comp);
-		MMPathTraceDRM(rdma);
-
+		/* Release the present fence on frame_done: the RDMA has
+		 * finished reading this frame's buffers, so SF may free
+		 * them. Releasing on frame_start (previous experiment) let
+		 * SF free the buffer while OVL still held the layer config
+		 * for the next scanout -> IOMMU fault (HDR_ADDR protect
+		 * page) + fault-recovery loop on screen on.
+		 */
 		if (mtk_crtc) {
 			atomic_set(&mtk_crtc->pf_event, 1);
 			wake_up_interruptible(&mtk_crtc->present_fence_wq);
 			atomic_set(&mtk_crtc->sf_pf_event, 1);
 			wake_up_interruptible(&mtk_crtc->sf_present_fence_wq);
 		}
+	}
+
+	if (val & (1 << 1)) {
+		DDPIRQ("[IRQ] %s: frame start!\n", mtk_dump_comp_str(rdma));
+		mtk_drm_refresh_tag_start(&priv->ddp_comp);
+		MMPathTraceDRM(rdma);
 	}
 
 	if (val & (1 << 3)) {

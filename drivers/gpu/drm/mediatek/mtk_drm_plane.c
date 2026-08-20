@@ -38,6 +38,10 @@ static const u32 formats[] = {
 	DRM_FORMAT_RGB565,   DRM_FORMAT_YUYV,     DRM_FORMAT_YVYU,
 	DRM_FORMAT_UYVY,     DRM_FORMAT_VYUY,     DRM_FORMAT_ABGR2101010,
 	DRM_FORMAT_ABGR16161616F,
+	/* A12 gralloc allocates 'RGB8'/'BGR8' (0x38424752/0x38524742)
+	 * for RGB888 buffers; A12 kernel plane list includes them */
+	0x38424752, /* 'RGB8' */
+	0x38524742, /* 'BGR8' */
 };
 
 unsigned int to_crtc_plane_index(unsigned int plane_index)
@@ -144,14 +148,17 @@ char *mtk_get_format_name(uint32_t format)
 }
 
 static struct mtk_drm_property mtk_plane_property[PLANE_PROP_MAX] = {
-	{DRM_MODE_PROP_ATOMIC, "NEXT_BUFF_IDX", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "LYE_BLOB_IDX", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "PLANE_PROP_ALPHA_CON", 0, 0x1, 0x1},
-	{DRM_MODE_PROP_ATOMIC, "PLANE_PROP_PLANE_ALPHA", 0, 0xFF, 0xFF},
-	{DRM_MODE_PROP_ATOMIC, "DATASPACE", 0, INT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "VPITCH", 0, UINT_MAX, 0},
-	{DRM_MODE_PROP_ATOMIC, "COMPRESS", 0, UINT_MAX, 0},
+	/* order matches A12 kernel (hwcomposer uses fixed property index) */
+	{DRM_MODE_PROP_ATOMIC, "MML_SUBMIT", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "IS_MML", 0, UINT_MAX, 0},
 	{DRM_MODE_PROP_ATOMIC, "DIM_COLOR", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "COMPRESS", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "VPITCH", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "DATASPACE", 0, INT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "PLANE_PROP_PLANE_ALPHA", 0, 0xFF, 0xFF},
+	{DRM_MODE_PROP_ATOMIC, "PLANE_PROP_ALPHA_CON", 0, 0x1, 0x1},
+	{DRM_MODE_PROP_ATOMIC, "LYE_BLOB_IDX", 0, UINT_MAX, 0},
+	{DRM_MODE_PROP_ATOMIC, "NEXT_BUFF_IDX", 0, UINT_MAX, 0},
 };
 
 static void mtk_plane_reset(struct drm_plane *plane)

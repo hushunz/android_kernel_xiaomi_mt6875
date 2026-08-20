@@ -968,8 +968,10 @@ err_mutex_unlock:
 	return 0;
 }
 
-static struct drm_atomic_state *
-mtk_drm_atomic_state_alloc(struct drm_device *dev)
+/* MTKDBG v162: global private for the loop-completion DL probe */
+struct mtk_drm_private *g_mtk_private;
+
+static struct drm_atomic_state *mtk_drm_atomic_state_alloc(struct drm_device *dev)
 {
 	struct mtk_atomic_state *mtk_state;
 
@@ -3063,6 +3065,8 @@ static int mtk_drm_probe(struct platform_device *pdev)
 
 	drm_debug = 0x2; /* DRIVER messages */
 	private = devm_kzalloc(dev, sizeof(*private), GFP_KERNEL);
+	/* MTKDBG v162: global private for the loop-completion DL probe */
+	g_mtk_private = private;
 	if (!private)
 		return -ENOMEM;
 
@@ -3320,8 +3324,66 @@ static int mtk_drm_sys_resume(struct device *dev)
 		return 0;
 	}
 
+	/* A12: clear the saved plane addresses in suspend_state BEFORE
+	 * drm_atomic_helper_resume so mtk_crtc_restore_plane_setting does
+	 * not write stale (SF-freed) addresses into OVL. Reading a released
+	 * address stalls the whole pipeline: OVL produces no output ->
+	 * RDMA gets no data -> DSI never completes a frame -> the trig loop
+	 * parks on WFE(DSI0_FRAME_DONE=57) and times out, leaving the
+	 * display dead after wake (screen won't turn on). Keep enable=1 so
+	 * the restored layer comes up as constant color (CON bit28, no
+	 * address read) and the pipeline keeps producing frames until the
+	 * SF feeds fresh buffers via atomic_flush. */
+	{
+		struct drm_plane *plane;
+
+		drm_for_each_plane(plane, drm) {
+			struct __drm_planes_state *ps =
+				&private->suspend_state->planes[plane->index];
+			struct mtk_plane_state *mps;
+
+			if (!ps->state)
+				continue;
+			mps = to_mtk_plane_state(ps->state);
+			mps->pending.addr = 0;
+		}
+	}
+
 	drm_atomic_helper_resume(drm, private->suspend_state);
 	drm_kms_helper_poll_enable(drm);
+
+	/* Keep the live plane_state addresses cleared too (post-resume
+	 * layer_config must not reuse them); enable stays true so the
+	 * restored layers run as constant color until SF's first frame. */
+	{
+		int i, p;
+
+		for (i = 0; i < MAX_CRTC; i++) {
+			struct drm_crtc *crtc = private->crtc[i];
+			struct mtk_drm_crtc *mtk_crtc;
+
+			if (!crtc)
+				continue;
+			mtk_crtc = to_mtk_crtc(crtc);
+			for (p = 0; p < mtk_crtc->layer_nr; p++) {
+				struct mtk_plane_state *ps = to_mtk_plane_state(
+					mtk_crtc->planes[p].base.state);
+				ps->pending.addr = 0;
+			}
+		}
+	}
+
+	/* v210: after the resume has restarted the trig loop, pulse the
+	 * stream events once to drain the CFG thread: the screen-off cycle
+	 * left a commit pkt parked on wait(STREAM_EOF=641) (edge missed when
+	 * the loop stopped mid-frame), and mtk_crtc_set_dirty queues behind
+	 * it - deadlock (Pre-dump: "wait for event 641 become 1 value:0").
+	 * The fresh loop parks on wfe(DIRTY); clear+set DIRTY makes it run a
+	 * frame, set EOF and drain the parked pkt. Register-level
+	 * (CMDQ_SYNC_TOKEN_UPD) so it bypasses the parked thread itself.
+	 * Deliberately NOT on the boot/first-enable path - pulsing events
+	 * while the DSI initializes desyncs it (v209 regression). */
+	mtk_drm_crtc_wakeup_pulse();
 
 	DRM_DEBUG_DRIVER("mtk_drm_sys_resume\n");
 	return 0;
@@ -3330,6 +3392,52 @@ static int mtk_drm_sys_resume(struct device *dev)
 
 static SIMPLE_DEV_PM_OPS(mtk_drm_pm_ops, mtk_drm_sys_suspend,
 			 mtk_drm_sys_resume);
+
+/* MTKDBG v162: MMSYS DL_VALID/READY + MUTEX EN read at loop completion
+ * (rate-limited from trig_done_cb) - DL_VALID_0=0 with READY!=0 means
+ * the OVL0->RDMA0 data link never handshakes even though the SOF was
+ * produced (MUTEX EN auto-clears), i.e. the stall is in the MMSYS
+ * connection, not in the trigger itself. */
+void mtk_drm_mmsys_dump(void)
+{
+	struct mtk_drm_private *private = g_mtk_private;
+
+	if (private && private->config_regs) {
+		pr_err("MTKDBG LOOP_DONE DL_VALID=0x%x,0x%x,0x%x READY=0x%x,0x%x,0x%x\n",
+		       readl(private->config_regs + 0xe9c),
+		       readl(private->config_regs + 0xea0),
+		       readl(private->config_regs + 0xea4),
+		       readl(private->config_regs + 0xea8),
+		       readl(private->config_regs + 0xeac),
+		       readl(private->config_regs + 0xeb0));
+		/* MTKDBG v164: the ACTUAL OVL0->RDMA0 link regs (the earlier
+		 * 0xf10/0xf44 were the wrong ones): MMSYS_OVL_CON(0xf4c)
+		 * selects OVL0's blend-out, TOVL0_OUT1_MOUT_EN(0xf74) bit0
+		 * gates OVL0_VIRTUAL0->RDMA0. 0 here after resume means the
+		 * path was never re-connected -> RDMA0 never sees OVL data. */
+		pr_err("MTKDBG LOOP_DONE OVL_CON=0x%x TOVL0_OUT1=0x%x\n",
+		       readl(private->config_regs + 0xf4c),
+		       readl(private->config_regs + 0xf74));
+	}
+	/* MTKDBG v165: RDMA0 data counters at loop completion - if the
+	 * frame data path is alive these are non-zero (or at least the
+	 * OVL main engine is feeding RDMA0); all-zero on a normally
+	 * completing loop means even "good" loops are empty frames. */
+	{
+		struct mtk_ddp_comp *rdma0 =
+			private->ddp_comp[DDP_COMPONENT_RDMA0];
+
+		if (rdma0 && rdma0->regs)
+			pr_err("MTKDBG LOOP_DONE RDMA0 IN_P=0x%x OUT_P=0x%x\n",
+			       readl(rdma0->regs + 0x120),
+			       readl(rdma0->regs + 0x128));
+	}
+	{
+		extern void mtk_mutex_en_dump(unsigned int id);
+		mtk_mutex_en_dump(0);
+	}
+}
+EXPORT_SYMBOL(mtk_drm_mmsys_dump);
 
 static const struct of_device_id mtk_drm_of_ids[] = {
 	{.compatible = "mediatek,mt2701-mmsys",

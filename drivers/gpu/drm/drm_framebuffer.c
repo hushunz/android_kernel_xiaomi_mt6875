@@ -328,6 +328,11 @@ int drm_mode_addfb2(struct drm_device *dev,
 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
 		return -EINVAL;
 
+	/* [DRM-DBG] fb creation args from composer */
+	if (!strncmp(current->comm, "composer@2.3-se", 15))
+		pr_err("[DRM-DBG] ADDFB2 w=%d h=%d fmt=0x%x fb_id=%u\n",
+		       r->width, r->height, r->pixel_format, r->fb_id);
+
 	fb = drm_internal_framebuffer_create(dev, r, file_priv);
 	if (IS_ERR(fb))
 		return PTR_ERR(fb);

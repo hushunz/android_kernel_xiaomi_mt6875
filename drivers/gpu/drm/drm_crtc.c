@@ -562,6 +562,12 @@ int drm_mode_setcrtc(struct drm_device *dev, void *data,
 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
 		return -EINVAL;
 
+	/* [DRM-DBG] SETCRTC args from composer */
+	if (!strncmp(current->comm, "composer@2.3-se", 15))
+		pr_err("[DRM-DBG] SETCRTC crtc_id=%d fb_id=%d mode_valid=%d x=%d y=%d conns=%d\n",
+		       crtc_req->crtc_id, crtc_req->fb_id, crtc_req->mode_valid,
+		       crtc_req->x, crtc_req->y, crtc_req->count_connectors);
+
 	/*
 	 * Universal plane src offsets are only 16.16, prevent havoc for
 	 * drivers using universal plane code internally.
@@ -575,6 +581,18 @@ int drm_mode_setcrtc(struct drm_device *dev, void *data,
 		return -ENOENT;
 	}
 	DRM_DEBUG_KMS("[CRTC:%d:%s]\n", crtc->base.id, crtc->name);
+
+	if (!strncmp(current->comm, "composer@2.3-se", 15))
+		pr_err("[DRM-DBG] SETCRTC found crtc id=%d primary_fb=%p\n",
+		       crtc->base.id, crtc->primary->fb);
+	if (!strncmp(current->comm, "composer@2.3-se", 15) && crtc_req->mode_valid)
+		pr_err("[DRM-DBG] SETCRTC mode: clk=%d hdisp=%u hss=%u hse=%u htot=%u vdisp=%u vss=%u vse=%u vtot=%u flags=0x%x type=0x%x name='%s'\n",
+		       crtc_req->mode.clock, crtc_req->mode.hdisplay,
+		       crtc_req->mode.hsync_start, crtc_req->mode.hsync_end,
+		       crtc_req->mode.htotal, crtc_req->mode.vdisplay,
+		       crtc_req->mode.vsync_start, crtc_req->mode.vsync_end,
+		       crtc_req->mode.vtotal, crtc_req->mode.flags,
+		       crtc_req->mode.type, crtc_req->mode.name);
 
 	mutex_lock(&crtc->dev->mode_config.mutex);
 	drm_modeset_acquire_init(&ctx, 0);
@@ -629,17 +647,26 @@ retry:
 							   fb->format->format);
 			if (ret) {
 				struct drm_format_name_buf format_name;
+				if (!strncmp(current->comm, "composer@2.3-se", 15))
+					pr_err("[DRM-DBG] SETCRTC pixel_format FAIL fmt=0x%x count=%d\n",
+					       fb->format->format,
+					       crtc->primary->format_count);
 				DRM_DEBUG_KMS("Invalid pixel format %s\n",
-				              drm_get_format_name(fb->format->format,
-				                                  &format_name));
+					      drm_get_format_name(fb->format->format,
+					                          &format_name));
 				goto out;
 			}
 		}
 
 		ret = drm_crtc_check_viewport(crtc, crtc_req->x, crtc_req->y,
 					      mode, fb);
-		if (ret)
+		if (ret) {
+			if (!strncmp(current->comm, "composer@2.3-se", 15))
+				pr_err("[DRM-DBG] SETCRTC viewport FAIL ret=%d fb=%ux%u mode=%ux%u\n",
+				       ret, fb->width, fb->height,
+				       mode->hdisplay, mode->vdisplay);
 			goto out;
+		}
 
 	}
 
@@ -705,6 +732,8 @@ retry:
 	set.num_connectors = crtc_req->count_connectors;
 	set.fb = fb;
 	ret = __drm_mode_set_config_internal(&set, &ctx);
+	if (!strncmp(current->comm, "composer@2.3-se", 15))
+		pr_err("[DRM-DBG] SETCRTC config_internal ret=%d\n", ret);
 
 out:
 	if (fb)

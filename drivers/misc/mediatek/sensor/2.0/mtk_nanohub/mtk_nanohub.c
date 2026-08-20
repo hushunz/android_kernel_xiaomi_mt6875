@@ -1996,11 +1996,13 @@ void mtk_nanohub_power_up_loop(void *data)
 		READ_ONCE(device->scp_sensor_fifo->fifo_size));
 	/* 3. send dram information to scp */
 	mtk_nanohub_send_dram_info_to_hub();
-	/* 4. start timesync */
+	/* 4. get device info for mag lib and dynamic list */
+	mtk_nanohub_get_devinfo();
+	/* 5. start timesync */
 	mtk_nanohub_start_timesync();
-	/* 5. we restore sensor calibration data when scp reboot */
+	/* 6. we restore sensor calibration data when scp reboot */
 	mtk_nanohub_restoring_config();
-	/* 6. we enable sensor which sensor is enable by framework */
+	/* 7. we enable sensor which sensor is enable by framework */
 	mutex_lock(&sensor_state_mtx);
 	for (id = 0; id < ID_SENSOR_MAX; id++)
 		mtk_nanohub_restoring_sensor(id);
@@ -2766,6 +2768,8 @@ static int mtk_nanohub_create_manager(void)
 		return err;
 	}
 
+	pr_err("[NANOHUB-DBG] create_manager done support_size=%u\n",
+		support_size);
 	atomic64_set(&device->mtk_nanohub_ready_time, ktime_get_boot_ns());
 	atomic_set(&device->mtk_nanohub_ready, 1);
 	return err;

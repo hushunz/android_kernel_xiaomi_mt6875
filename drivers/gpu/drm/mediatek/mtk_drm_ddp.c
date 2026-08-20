@@ -644,6 +644,9 @@ struct mtk_disp_mutex {
 	bool claimed;
 };
 
+/* MTKDBG v162: global ddp for the loop-completion EN probe */
+static struct mtk_ddp *g_mtk_ddp;
+
 /*For MT6853*/
 #define MT6853_DISP_OVL0_MOUT_EN 0xf04
 
@@ -5914,6 +5917,27 @@ void mutex_dump_analysis_mt6885(struct mtk_disp_mutex *mutex)
 	int len = 0;
 	unsigned int val;
 
+	/* MTKDBG v87: mutex frame-sync state at ERR level */
+	DDPPR_ERR("MTKDBG MUTEX%d SOF=0x%x MOD=0x%x MOD2=0x%x\n",
+		  mutex->id,
+		  readl_relaxed(ddp->regs +
+				DISP_REG_MUTEX_SOF(ddp->data, mutex->id)),
+		  readl_relaxed(ddp->regs +
+				DISP_REG_MUTEX_MOD(ddp->data, mutex->id)),
+		  readl_relaxed(ddp->regs + DISP_REG_MUTEX_MOD2(mutex->id)));
+
+	/* MTKDBG v161: full MUTEX0 control state - EN(0x20)=1 is required
+	 * for the trigger to produce a SOF; if EN got cleared the trigger
+	 * writes are ignored and the OVL/RDMA data path never starts
+	 * (RDMA0 counters stay 0, DSI BUSY, FRAME_DONE(57) never fires). */
+	DDPPR_ERR("MTKDBG MUTEX%d INTEN=0x%x CFG=0x%x EN=0x%x MUTEX=0x%x RST=0x%x\n",
+		  mutex->id,
+		  readl_relaxed(ddp->regs + DISP_REG_MUTEX_INTEN),
+		  readl_relaxed(ddp->regs + DISP_REG_MUTEX_CFG),
+		  readl_relaxed(ddp->regs + DISP_REG_MUTEX_EN(mutex->id)),
+		  readl_relaxed(ddp->regs + DISP_REG_MUTEX(mutex->id)),
+		  readl_relaxed(ddp->regs + DISP_REG_MUTEX_RST(mutex->id)));
+
 	DDPDUMP("== DISP Mutex Analysis ==\n");
 	for (i = 0; i < 5; i++) {
 		unsigned int mod0, mod1;
@@ -7332,10 +7356,22 @@ static int mtk_ddp_probe(struct platform_device *pdev)
 	pm_runtime_enable(dev);
 
 	platform_set_drvdata(pdev, ddp);
+	g_mtk_ddp = ddp;
 	DDPINFO("%s-\n", __func__);
 
 	return 0;
 }
+
+/* MTKDBG v162: MUTEX0 EN read for the loop-completion probe - 1 means
+ * EN is sticky (a 0 at timeout = enable_cmdq never ran), 0 means the HW
+ * clears EN after each SOF (a 0 at timeout is normal). */
+void mtk_mutex_en_dump(unsigned int id)
+{
+	if (g_mtk_ddp && g_mtk_ddp->regs)
+		pr_err("MTKDBG LOOP_DONE MUTEX%d EN=0x%x\n", id,
+		       readl(g_mtk_ddp->regs + DISP_REG_MUTEX_EN(id)));
+}
+EXPORT_SYMBOL(mtk_mutex_en_dump);
 
 static int mtk_ddp_remove(struct platform_device *pdev)
 {

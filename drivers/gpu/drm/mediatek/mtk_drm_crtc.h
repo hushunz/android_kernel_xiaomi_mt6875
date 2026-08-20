@@ -350,26 +350,32 @@ enum DISP_PMQOS_SLOT {
 			(__i)++)
 
 enum MTK_CRTC_PROP {
-	CRTC_PROP_OVERLAP_LAYER_NUM,
-	CRTC_PROP_LYE_IDX,
-	CRTC_PROP_PRES_FENCE_IDX,
-	CRTC_PROP_SF_PRES_FENCE_IDX,
-	CRTC_PROP_DOZE_ACTIVE,
-	CRTC_PROP_OUTPUT_ENABLE,
-	CRTC_PROP_OUTPUT_FENCE_IDX,
-	CRTC_PROP_OUTPUT_X,
-	CRTC_PROP_OUTPUT_Y,
-	CRTC_PROP_OUTPUT_WIDTH,
-	CRTC_PROP_OUTPUT_HEIGHT,
-	CRTC_PROP_OUTPUT_FB_ID,
-	CRTC_PROP_INTF_FENCE_IDX,
-	CRTC_PROP_DISP_MODE_IDX,
-	CRTC_PROP_HBM_ENABLE,
-	CRTC_PROP_COLOR_TRANSFORM,
-	CRTC_PROP_USER_SCEN,
+	/* order matches A12 kernel (hwcomposer uses fixed property index) */
+	CRTC_PROP_OVL_DSI_SEQ,
 	CRTC_PROP_HDR_ENABLE,
+	CRTC_PROP_USER_SCEN,
+	CRTC_PROP_COLOR_TRANSFORM,
+	CRTC_PROP_HBM_ENABLE,
+	CRTC_PROP_DISP_MODE_IDX,
+	CRTC_PROP_INTF_FENCE_IDX,
+	CRTC_PROP_OUTPUT_FB_ID,
+	CRTC_PROP_OUTPUT_HEIGHT,
+	CRTC_PROP_OUTPUT_WIDTH,
+	CRTC_PROP_OUTPUT_Y,
+	CRTC_PROP_OUTPUT_X,
+	CRTC_PROP_OUTPUT_FENCE_IDX,
+	CRTC_PROP_OUTPUT_ENABLE,
+	CRTC_PROP_DOZE_ACTIVE,
+	CRTC_PROP_SF_PRESENT_FENCE,
+	CRTC_PROP_PRES_FENCE_IDX,
+	CRTC_PROP_LYE_IDX,
+	CRTC_PROP_OVERLAP_LAYER_NUM,
+	/* A11 extras kept at the end */
 	CRTC_PROP_ICON_ENABLE,
 	CRTC_PROP_ENROLL_ENABLE,
+	/* A12 hwcomposer DrmObject::checkProperty() fails -EINVAL if missing */
+	CRTC_PROP_MSYNC2_0_ENABLE,
+	CRTC_PROP_SKIP_CONFIG,
 	CRTC_PROP_MAX,
 };
 
@@ -725,13 +731,6 @@ struct mtk_drm_crtc {
 	wait_queue_head_t sf_present_fence_wq;
 	struct task_struct *sf_pf_release_thread;
 	atomic_t sf_pf_event;
-
-	/*capture write back ctx*/
-	struct mutex cwb_lock;
-	struct mtk_cwb_info *cwb_info;
-	struct task_struct *cwb_task;
-	wait_queue_head_t cwb_wq;
-	atomic_t cwb_task_active;
 };
 
 struct mtk_crtc_state {
@@ -790,7 +789,6 @@ int mtk_drm_crtc_getfence_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *file_priv);
 int mtk_drm_crtc_get_sf_fence_ioctl(struct drm_device *dev, void *data,
 				    struct drm_file *file_priv);
-void mtk_crtc_cwb_path_disconnect(struct drm_crtc *crtc);
 
 long mtk_crtc_wait_status(struct drm_crtc *crtc, bool status, long timeout);
 int mtk_crtc_path_switch(struct drm_crtc *crtc, unsigned int path_sel,
@@ -861,6 +859,7 @@ unsigned int mtk_drm_primary_display_get_debug_state(
 bool mtk_crtc_with_trigger_loop(struct drm_crtc *crtc);
 void mtk_crtc_stop_trig_loop(struct drm_crtc *crtc);
 void mtk_crtc_start_trig_loop(struct drm_crtc *crtc);
+bool mtk_crtc_dsi0_in_path(struct mtk_drm_crtc *mtk_crtc);
 
 #if defined(CONFIG_MACH_MT6873) || defined(CONFIG_MACH_MT6853) \
 	|| defined(CONFIG_MACH_MT6833)
@@ -896,6 +895,7 @@ struct golden_setting_context *
 /***********************  PanelMaster  ********************************/
 void mtk_crtc_start_for_pm(struct drm_crtc *crtc);
 void mtk_crtc_stop_for_pm(struct mtk_drm_crtc *mtk_crtc, bool need_wait);
+void mtk_drm_crtc_wakeup_pulse(void);
 bool mtk_crtc_frame_buffer_existed(void);
 
 #endif /* MTK_DRM_CRTC_H */

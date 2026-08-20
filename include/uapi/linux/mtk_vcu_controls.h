@@ -17,7 +17,9 @@
 #ifndef __UAPI_MTK_VCU_CONTROLS_H__
 #define __UAPI_MTK_VCU_CONTROLS_H__
 
-#define SHARE_BUF_SIZE 72
+/* A12 kernel uses SHARE_BUF_SIZE=80 (share_obj=88B); A12 vpud builds against
+ * that UAPI, so match it (was 72 -> VCU_GET_OBJECT cmd mismatch -> -EINVAL storm) */
+#define SHARE_BUF_SIZE 80
 #define LOG_INFO_SIZE 1024
 #define VCODEC_CMDQ_CMD_MAX           (2048)
 

@@ -1438,8 +1438,14 @@ static int xgf_enter_est_runtime(int rpid, struct xgf_render *render,
 {
 	int ret;
 
-	WARN_ON(!xgf_est_runtime_fp);
-
+	/* A12 kernel.elf has no xgf_est_runtime_fp mechanism at all (the
+	 * symbol does not exist - nm); its fpsgo_comp2xgf_qudeq_notify is
+	 * a different implementation (only ~15% instruction similarity to
+	 * the A11 one). On A11 the callback is never registered, so every
+	 * frame from the A12 vendor hits this WARN_ON: a 3-6x stack-dump
+	 * storm per frame that starves the kworkers (including the fault
+	 * recovery workqueue) and jitters the whole display pipeline.
+	 * Drop the WARN - a NULL callback simply returns -ENOENT. */
 	if (xgf_est_runtime_fp)
 		ret = xgf_est_runtime_fp(rpid, render, runtime, ts);
 	else

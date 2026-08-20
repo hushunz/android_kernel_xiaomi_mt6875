@@ -812,7 +812,7 @@ static void mtk_dsi_enable(struct mtk_dsi *dsi)
 #endif
 }
 
-static void mtk_dsi_disable(struct mtk_dsi *dsi)
+static void __maybe_unused mtk_dsi_disable(struct mtk_dsi *dsi)
 {
 	mtk_dsi_mask(dsi, DSI_CON_CTRL, DSI_EN, 0);
 }
@@ -1447,23 +1447,35 @@ static void mtk_dsi_cmdq_poll(struct mtk_ddp_comp *comp,
 			      struct cmdq_pkt *handle, unsigned int reg,
 			      unsigned int val, unsigned int mask)
 {
-	struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
-	struct cmdq_client *client = mtk_crtc->gce_obj.client[CLIENT_DSI_CFG];
-
 	if (handle == NULL)
 		DDPPR_ERR("%s no cmdq handle\n", __func__);
 
-#if 0
-	cmdq_pkt_poll_reg(handle, val, comp->cmdq_subsys, reg & 0xFFFF, mask);
+	/* The GPR-timer based poll (cmdq_pkt_poll_timeout) hangs the CFG
+	 * thread on WFE(GPR_TIMER_R7=1001) on this kernel - the TPR timer
+	 * never fires, the pkt sits at WAIT EVENT:1001 forever, and the
+	 * 1s cmdq timeout -> reset -> retry loop then takes the whole
+	 * display stack down (lock screen never wakes). poll_reg is a
+	 * plain read/compare/jump loop with no timer dependency; the
+	 * cmdq SW timeout still bounds it if the target never matches.
+	 */
+#if 1
+	cmdq_pkt_poll_reg(handle, val, SUBSYS_NO_SUPPORT, reg & 0xFFFF,
+			  mask);
 #else
-	if (handle->cl == (void *)client) {
-		cmdq_pkt_poll_timeout(handle, val, SUBSYS_NO_SUPPORT,
+	{
+		struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
+		struct cmdq_client *client =
+			mtk_crtc->gce_obj.client[CLIENT_DSI_CFG];
+
+		if (handle->cl == (void *)client) {
+			cmdq_pkt_poll_timeout(handle, val, SUBSYS_NO_SUPPORT,
 					  reg, mask, 0xFFFF,
 					  CMDQ_GPR_R14);
-	} else {
-		cmdq_pkt_poll_timeout(handle, val, SUBSYS_NO_SUPPORT,
+		} else {
+			cmdq_pkt_poll_timeout(handle, val, SUBSYS_NO_SUPPORT,
 					  reg, mask, 0xFFFF,
 					  CMDQ_GPR_R07);
+		}
 	}
 #endif
 }
@@ -1992,8 +2004,12 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 	struct drm_crtc *crtc = dsi->encoder.crtc;
 	struct mtk_crtc_state *mtk_state = to_mtk_crtc_state(crtc->state);
 	unsigned int mode_id = mtk_state->prop_val[CRTC_PROP_DISP_MODE_IDX];
+	unsigned long long t0 = sched_clock();
 
 	DDPINFO("%s +\n", __func__);
+	pr_err("MTKDBG DSI_ENABLE out_en=%d doze=%d force=%d\n",
+	       dsi->output_en, dsi->doze_enabled, force_lcm_update);
+	pr_err("MTKDBG DSI_ENABLE_T begin\n");
 
 	if (dsi->output_en) {
 		if (mtk_dsi_doze_status_change(dsi))
@@ -2016,6 +2032,8 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 		dev_err(dsi->dev, "config dsi fail: %d", ret);
 		return;
 	}
+	pr_err("MTKDBG DSI_ENABLE_T +%lluus: preconfig done\n",
+	       (sched_clock() - t0) / 1000);
 
 	if (dsi->panel) {
 		if ((!dsi->doze_enabled || force_lcm_update)
@@ -2023,6 +2041,9 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 			DDPPR_ERR("failed to prepare the panel\n");
 			return;
 		}
+		pr_err("MTKDBG DSI_ENABLE panel prepared\n");
+		pr_err("MTKDBG DSI_ENABLE_T +%lluus: panel prepare done\n",
+		       (sched_clock() - t0) / 1000);
 
 		if (dsi->ddp_comp.mtk_crtc && dsi->ddp_comp.mtk_crtc->esd_ctx) {
 			dsi->ddp_comp.mtk_crtc->esd_ctx->panel_init = true;
@@ -2093,6 +2114,15 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 		mtk_dsi_clk_hs_mode(dsi->slave_dsi, 1);
 	}
 
+	/* A12 (mtk_output_dsi_enable @0x889a2f4): CMD panels are NOT
+	 * started here - the trig loop's per-frame config_trigger
+	 * (DSI_START 0->1) starts the DSI right before the frame data is
+	 * transferred. Starting it early (A11) leaves the DSI engine in
+	 * "BUSY waiting for data" before the first frame's data path is
+	 * up, which is exactly what stalls FRAME_DONE(57) on resume
+	 * (RDMA counters 0, DSI BUSY, screen stays black while the system
+	 * reports "screen on"). Video panels still get an explicit start.
+	 */
 	if (!mtk_dsi_is_cmd_mode(&dsi->ddp_comp))
 		mtk_dsi_start(dsi);
 
@@ -2102,6 +2132,54 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 			goto err_dsi_power_off;
 		}
 		mtk_dsi_crtc_notify(dsi);
+		pr_err("MTKDBG DSI_ENABLE_T +%lluus: panel enable done\n",
+		       (sched_clock() - t0) / 1000);
+
+		/* Restart the trig loop now that the panel is on and TE is
+		 * coming again (it was stopped in mtk_output_dsi_disable so
+		 * DSI could go idle for the panel-off commands).
+		 */
+		if (dsi->ddp_comp.mtk_crtc &&
+		    !dsi->ddp_comp.mtk_crtc->trig_loop_cmdq_handle &&
+		    mtk_crtc_with_trigger_loop(
+			    &dsi->ddp_comp.mtk_crtc->base))
+			mtk_crtc_start_trig_loop(
+				&dsi->ddp_comp.mtk_crtc->base);
+		pr_err("MTKDBG DSI_ENABLE_T +%lluus: trig loop restart done\n",
+		       (sched_clock() - t0) / 1000);
+
+		/* A12 (mtk_output_dsi_enable event packet @0x8899c24):
+		 * sync on the loop's event state after resume and drop any
+		 * stale STREAM_DIRTY:
+		 *   wait_no_clear(STREAM_EOF) - the loop holds EOF set
+		 *     between frames, passes instantly, does not clear it
+		 *   clear(STREAM_DIRTY) - a DIRTY left set by the frame
+		 *     before suspend would wake an EMPTY trigger (layers
+		 *     not yet re-fed on resume) - that empty trigger leaves
+		 *     the OVL/RDMA data path dead (RDMA counters 0, DSI
+		 *     BUSY, FRAME_DONE(57) never fires, screen stays black
+		 *     while the system reports "screen on").
+		 * (A12's wfe(BLOCK)/wfe(CABC)/wfe(EOF) clears are skipped:
+		 * clearing them here would stall the loop's own
+		 * wait_no_clear(BLOCK/CABC) and the first commit's
+		 * wait_no_clear(EOF) before anything re-sets them.)
+		 */
+		if (dsi->ddp_comp.mtk_crtc) {
+			struct mtk_drm_crtc *m_crtc =
+				dsi->ddp_comp.mtk_crtc;
+			struct cmdq_pkt *rhandle;
+
+			mtk_crtc_pkt_create(&rhandle, &m_crtc->base,
+				m_crtc->gce_obj.client[CLIENT_CFG]);
+			cmdq_pkt_wait_no_clear(rhandle,
+				m_crtc->gce_obj.event[EVENT_STREAM_EOF]);
+			cmdq_pkt_clear_event(rhandle,
+				m_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
+			cmdq_pkt_flush(rhandle);
+			cmdq_pkt_destroy(rhandle);
+			pr_err("MTKDBG DSI_ENABLE_T +%lluus: eof-dirty flush done\n",
+			       (sched_clock() - t0) / 1000);
+		}
 
 		/* Suspend to Doze */
 		if (mtk_dsi_doze_status_change(dsi)) {
@@ -2122,6 +2200,9 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 	dsi->output_en = true;
 	dsi->doze_enabled = new_doze_state;
 
+	pr_err("MTKDBG DSI_ENABLE_T +%lluus: enable done (total)\n",
+	       (sched_clock() - t0) / 1000);
+
 	return;
 err_dsi_power_off:
 	mtk_dsi_stop(dsi);
@@ -2136,31 +2217,33 @@ static int mtk_dsi_wait_cmd_frame_done(struct mtk_dsi *dsi,
 {
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(dsi->encoder.crtc);
 	struct cmdq_pkt *handle;
-	bool new_doze_state = mtk_dsi_doze_state(dsi);
 
 	mtk_crtc_pkt_create(&handle,
 		&mtk_crtc->base,
 		mtk_crtc->gce_obj.client[CLIENT_CFG]);
 
-	/* wait frame done */
+	/* A12 mtk_output_dsi_disable packet @0xffffff800889a748,
+	 * instruction-for-instruction:
+	 *   wait_no_clear(STREAM_EOF) - loop keeps EOF set between frames,
+	 *                               passes instantly, does NOT clear it
+	 *   wait_no_clear(CMD_EOF=57)  - DSI FRAME_DONE, fires every TE
+	 *                               while the panel still refreshes
+	 *   wait_no_clear(STREAM_EOF)
+	 *   clear(STREAM_BLOCK)        - park the loop (it idles on
+	 *                               wait_no_clear(643) until the next
+	 *                               hw_block_ready re-arms it)
+	 * The old set()/set()/set()/NOP version skipped the frame-done
+	 * handshake; the wait_no_clear forms never block here because the
+	 * trig loop is still running (encoder disable runs before crtc
+	 * stop, and EOF stays set between loop frames).
+	 */
 	cmdq_pkt_wait_no_clear(handle,
 		mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
-
-	/* When system ready to go to Doze suspend stage, it has to
-	 * update the latest image before entering it to make sure display
-	 * correctly. Since it's hard to know how many frame config GCE
-	 * commands are there in the waiting queue, so here we force
-	 * frame updating and wait for the latest frame done.
-	 */
-	if (new_doze_state && !force_lcm_update) {
-		cmdq_pkt_set_event(handle,
-			mtk_crtc->gce_obj.event[EVENT_STREAM_DIRTY]);
-		cmdq_pkt_wait_no_clear(handle,
-			mtk_crtc->gce_obj.event[EVENT_CMD_EOF]);
-	}
-
-	cmdq_pkt_clear_event(
-		handle,
+	cmdq_pkt_wait_no_clear(handle,
+		mtk_crtc->gce_obj.event[EVENT_CMD_EOF]);
+	cmdq_pkt_wait_no_clear(handle,
+		mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
+	cmdq_pkt_clear_event(handle,
 		mtk_crtc->gce_obj.event[EVENT_STREAM_BLOCK]);
 
 	cmdq_pkt_flush(handle);
@@ -2185,11 +2268,23 @@ static void mtk_output_dsi_disable(struct mtk_dsi *dsi,
 	}
 	//g_notify_data.data = &dsi->doze_state;
 
-	if (!dsi->output_en)
+	if (!dsi->output_en) {
+		pr_err("MTKDBG DSI_DISABLE skip out_en=0 doze=%d\n",
+		       dsi->doze_enabled);
 		return;
+	}
+	pr_err("MTKDBG DSI_DISABLE out_en=1 doze=%d\n", dsi->doze_enabled);
 
 	//drm_notifier_call_chain(DRM_EARLY_EVENT_BLANK, &g_notify_data);
 	mtk_drm_crtc_wait_blank(mtk_crtc);
+
+	/* A12 keeps the trig loop running across screen-off (loop idles on
+	 * wfe(57), DSI keeps refreshing, BUSY is only transient) - the
+	 * panel-off commands below succeed. Stopping the loop here left
+	 * DSI in a half transfer with BUSY stuck and the commands timed
+	 * out - removed, matching A12 (mtk_output_dsi_disable has no
+	 * stop_trig_loop either).
+	 */
 
 	/* 1. If not doze mode, turn off backlight */
 	if (dsi->panel && (!new_doze_state || force_lcm_update)) {
@@ -2219,19 +2314,21 @@ static void mtk_output_dsi_disable(struct mtk_dsi *dsi,
 		}
 	}
 
-	/* set DSI into ULPS mode */
-	mtk_dsi_reset_engine(dsi);
+	/* set DSI into ULPS mode - A12 mtk_output_dsi_disable
+	 * (@0xffffff800889a61c) only does enter_ulps + poweroff here;
+	 * it has no reset_engine / dsi_disable / dsi_stop at all (the
+	 * A12 symtab has no such functions). Those three stop the DSI
+	 * engine for real (RESET pulse, DSI_EN=0, DSI_START=0), but
+	 * resume's mtk_dsi_poweron is refcnt++ which skips re-init when
+	 * clk_refcnt never hit 0 - so the engine stays dead after
+	 * suspend and FRAME_DONE(57) never fires again (loop deadlock).
+	 */
 	mtk_dsi_enter_ulps(dsi);
-	mtk_dsi_disable(dsi);
-	mtk_dsi_stop(dsi);
 	mtk_dsi_poweroff(dsi);
 
 	if (dsi->slave_dsi) {
 		/* set DSI into ULPS mode */
-		mtk_dsi_reset_engine(dsi->slave_dsi);
 		mtk_dsi_enter_ulps(dsi->slave_dsi);
-		mtk_dsi_disable(dsi->slave_dsi);
-		mtk_dsi_stop(dsi->slave_dsi);
 		mtk_dsi_poweroff(dsi->slave_dsi);
 	}
 
@@ -3041,10 +3138,21 @@ static void mtk_dsi_config_trigger(struct mtk_ddp_comp *comp,
 		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + 0x60, 1,
 			       ~0);
 
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			       comp->regs_pa + DSI_START, 0, ~0);
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			       comp->regs_pa + DSI_START, 1, ~0);
+		/* A12 (mtk_dsi_config_trigger @0xffffff80088959d8): after the
+		 * MUTEX trigger the DSI frame transfer is re-armed with
+		 * DSI_START 0->1 (0x8895ba8 writes regs+0x0 = 0, 0x8895c60
+		 * writes regs+0x0 = 1). Without this re-arm the DSI never
+		 * starts a new transfer after the trigger, so FRAME_DONE(57)
+		 * never fires and the trig loop stalls on wfe(57) forever
+		 * (screen stuck on the LK splash even though layers/RDMA are
+		 * up). The old #157 removal was a misread of the disasm; the
+		 * per-frame restart is safe now that the loop only triggers
+		 * on real commits (wfe(STREAM_DIRTY) gate).
+		 */
+		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DSI_START,
+			       0, ~0);
+		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DSI_START,
+			       1, ~0);
 		break;
 	case MTK_TRIG_FLAG_EOF:
 		mtk_dsi_poll_for_idle(dsi, handle);

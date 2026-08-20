@@ -368,43 +368,19 @@ static int ion_mm_heap_allocate(struct ion_heap *heap,
 	INIT_LIST_HEAD(&pages);
 
 #if (defined(CONFIG_MTK_M4U) || defined(CONFIG_MTK_PSEUDO_M4U))
-	if (heap->id == ION_HEAP_TYPE_MULTIMEDIA_MAP_MVA) {
-		/*for va-->mva case, align is used for va value */
-		table = m4u_create_sgtable(align, (unsigned int)size);
-		user_va = align;
-		if (size % PAGE_SIZE != 0)
-			IONDBG("%s va(0x%lx)size(%ld) not align page.\n",
-			       __func__, user_va, size);
-		if (IS_ERR_OR_NULL(table)) {
-			IONMSG("%s create table error 0x%p!!\n",
-			       __func__, table);
-			return -ENOMEM;
-		}
-
-		goto map_mva_exit;
-	}
-
-	if (heap->id == ION_HEAP_TYPE_MULTIMEDIA_PA2MVA) {
-		table = kzalloc(sizeof(*table), GFP_KERNEL);
-		if (!table) {
-			IONMSG("%s kzalloc failed table is null.\n", __func__);
-			goto err;
-		}
-		ret = sg_alloc_table(table, 1, GFP_KERNEL);
-		if (ret) {
-			IONMSG("%s PA2MVA sg table fail %d\n", __func__, ret);
-			goto err1;
-		}
-		sg_dma_address(table->sgl) = align;
-		sg_dma_len(table->sgl) = size;
-		table->sgl->length = size;
-#ifdef CONFIG_MTK_PSEUDO_M4U
-		page = phys_to_page(align);
-		sg_set_page(table->sgl, page, size, 0);
-#endif
-
-		goto map_mva_exit;
-	}
+	/* A12 kernel.elf ion_mm_heap_allocate @0xffffff80090814f4 has
+	 * NEITHER the va->mva nor the PA2MVA branch - it goes straight
+	 * from the size sanity check into the alloc_largest_available
+	 * loop (objdump: cmp size>>12 vs totalram/2 @0x...153c -> loop
+	 * @0x...15fc, and buffer_info->VA is stored NULL
+	 * "str xzr,[x0,#152]" @0x...1864).
+	 * The va->mva path pins the SF's user pages at alloc time via
+	 * m4u_create_sgtable(align); those pages go stale across
+	 * suspend/resume, so every buffer the SF submits after a blank
+	 * maps freed memory -> L0_OVL_RDMA0_HDR TRANSLATION|INVALID_PA
+	 * fault (int_state 0x285) every frame and the display dies.
+	 * Follow A12 exactly: always allocate normally and let the m4u
+	 * allocator assign the iova at map time. */
 #endif
 	if (align > PAGE_SIZE) {
 		IONMSG("%s align %lu is larger than PAGE_SIZE.\n", __func__,

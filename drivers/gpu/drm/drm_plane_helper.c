@@ -160,6 +160,9 @@ int drm_plane_helper_check_state(struct drm_plane_state *state,
 	vscale = drm_rect_calc_vscale(src, dst, min_scale, max_scale);
 	if (hscale < 0 || vscale < 0) {
 		DRM_DEBUG_KMS("Invalid scaling of plane\n");
+		if (!strncmp(current->comm, "composer@2.3-se", 15))
+			pr_err("[DRM-DBG] check_state: bad scaling h=%d v=%d fb=%ux%u\n",
+			       hscale, vscale, fb->width, fb->height);
 		drm_rect_debug_print("src: ", &state->src, true);
 		drm_rect_debug_print("dst: ", &state->dst, false);
 		return -ERANGE;
@@ -181,6 +184,9 @@ int drm_plane_helper_check_state(struct drm_plane_state *state,
 
 	if (!can_position && !drm_rect_equals(dst, clip)) {
 		DRM_DEBUG_KMS("Plane must cover entire CRTC\n");
+		if (!strncmp(current->comm, "composer@2.3-se", 15))
+			pr_err("[DRM-DBG] check_state: plane not cover crtc fb=%ux%u\n",
+			       fb->width, fb->height);
 		drm_rect_debug_print("dst: ", dst, false);
 		drm_rect_debug_print("clip: ", clip, false);
 		return -EINVAL;

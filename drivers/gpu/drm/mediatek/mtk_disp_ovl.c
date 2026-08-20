@@ -24,6 +24,7 @@
 #include "mtk_drm_drv.h"
 #include "mtk_drm_crtc.h"
 #include "mtk_drm_ddp_comp.h"
+#include "mtk_iommu_ext.h"
 #include "mtk_dump.h"
 #include "mtk_layering_rule_base.h"
 #include "mtk_rect.h"
@@ -295,6 +296,12 @@
 #define OVL_ROI_BGCLR (0xFF000000)
 
 #define OVL_CON_CLRFMT_MAN BIT(23)
+/* A12: OVL_CON_BYTE_SWAP lives on bit24 (kernel source + runtime
+ * 0x1002000 = bit24 | RGBA8888 for XBGR/ABGR). The earlier A11 change
+ * to BIT(20) was based on misreading 0x1002000 as "bit20" - bit20 is
+ * NOT the byte swap, so every ABGR/XBGR layer lost its swap (blue/red
+ * exchanged) and bit20 wrongly enabled the 10-bit path on 8-bit
+ * surfaces (oversized content). Restored to the A12 value. */
 #define OVL_CON_BYTE_SWAP BIT(24)
 #define OVL_CON_RGB_SWAP BIT(25)
 #define OVL_CON_MTX_JPEG_TO_RGB (4UL << 16)
@@ -353,6 +360,11 @@ static u32 sRGB_to_DCI_P3[CSC_COEF_NUM] = {215603, 46541, 0,     8702,  253442,
 
 static u32 DCI_P3_to_sRGB[CSC_COEF_NUM] = {
 	321111, -58967, 0, -11025, 273169, 0, -5148, -20614, 287906};
+
+/* MTKDBG v188: last faulting iova (exported by mtk_drm_crtc.c) - the
+ * faulted layer stays off until the SF feeds a different buffer. */
+extern unsigned long g_mtk_fault_iova;
+int mtk_drm_fault_is_blacklisted(unsigned long iova);
 
 #define DECLARE_MTK_OVL_COLORSPACE(EXPR)                                       \
 	EXPR(OVL_SRGB)                                                         \
@@ -601,8 +613,37 @@ static irqreturn_t mtk_disp_ovl_irq_handler(int irq, void *dev_id)
 		DDPPR_ERR("[IRQ] %s: frame underflow! cnt=%d\n",
 			  mtk_dump_comp_str(ovl), priv->underflow_cnt);
 		priv->underflow_cnt++;
-//		mtk_ovl_dump(ovl);
-//		mtk_ovl_analysis(ovl);
+		/* MTKDBG v16x: dump OVL0_2L layer regs at underflow time
+		 * (rate-limited). SRC_SIZE should be 540x2400 (dual-pipe
+		 * half), FBDC bit in DATAPATH_CON/Lx_CON tells whether the
+		 * A12 SF submits compressed (AFBC) buffers - a mismatch
+		 * between the A12 buffer layout and the A11 FBDC config is
+		 * the prime suspect for the per-frame 2L underflow while
+		 * scrolling. */
+		if (ovl->id == DDP_COMPONENT_OVL0_2L) {
+			static unsigned int uf_dump_cnt;
+			unsigned int i;
+
+			if (++uf_dump_cnt % 32 == 1) {
+				DDPPR_ERR("MTKDBG OVL2L DP_CON=0x%x\n",
+					  readl_relaxed(ovl->regs +
+						DISP_REG_OVL_DATAPATH_CON));
+				for (i = 0; i < 2; i++) {
+					DDPPR_ERR("MTKDBG OVL2L L%d CON=0x%x ADDR=0x%x SRC=0x%x PITCH=0x%x HDR_ADDR=0x%x\n",
+						  i,
+						  readl_relaxed(ovl->regs +
+							DISP_REG_OVL_CON(i)),
+						  readl_relaxed(ovl->regs +
+							DISP_REG_OVL_ADDR(priv, i)),
+						  readl_relaxed(ovl->regs +
+							DISP_REG_OVL_SRC_SIZE(i)),
+						  readl_relaxed(ovl->regs +
+							DISP_REG_OVL_PITCH(i)),
+						  readl_relaxed(ovl->regs +
+							DISP_REG_OVL_LX_HDR_ADDR(i)));
+				}
+			}
+		}
 	}
 	if (val & (1 << 3))
 		DDPIRQ("[IRQ] %s: sw reset done!\n", mtk_dump_comp_str(ovl));
@@ -682,7 +723,17 @@ static void mtk_ovl_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 
 	cmdq_pkt_write(handle, comp->cmdq_base,
 			comp->regs_pa + DISP_REG_OVL_INTEN,
-		       0x61F2, ~0);
+		       0x61E0, ~0);
+	/* A12 (kernel.elf mtk_ovl_start) enables only 0x61E0 - the A11
+	 * stock 0x61F2 additionally enables FME_UND(bit2)/HWRST_DONE(bit4)
+	 * FME_CPL(bit1). With the A12 SF submitting every frame (60fps
+	 * scrolling), the 2L engines hit a per-frame underflow and the
+	 * enabled underflow IRQ fires at 60Hz - an IRQ storm that jitters
+	 * the GCE/display timing and leaves corrupted frames on screen
+	 * (oversized "half-screen" content, stuck scaled frames on app
+	 * entry). Keeping underflow/hw-rst/frame-done IRQs masked (0x61E0)
+	 * makes the underflow silent exactly like the A12 kernel, and the
+	 * display stays continuous. */
 
 	/* In 6779 we need to set DISP_OVL_FORCE_RELAY_MODE */
 	if (compr_info && strncmp(compr_info->name, "PVRIC_V3_1", 10) == 0) {
@@ -865,6 +916,29 @@ static void mtk_ovl_layer_off(struct mtk_ddp_comp *comp, unsigned int idx,
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			       comp->regs_pa + DISP_REG_OVL_RDMA_CTRL(idx), 0,
 			       ~0);
+		/* A12 (reverse engineered mtk_ovl_layer_off): clear the
+		 * per-layer control bits in OVL_CON_EXT(0x2d8) and
+		 * OVL_CON_EXT2(0x2dc). Without this a disabled layer keeps
+		 * its OVL_CON config and stays "on but dead" - RDMA gets no
+		 * data, DSI never completes a frame (wfe(57) stalls) and the
+		 * panel-off commands time out. Each layer owns a 4-bit group
+		 * at bit(4*n).
+		 */
+		{
+			u32 sh = (idx & 0x3f) << 2;
+			u32 msk = 1u << (sh & 0x1f) |
+				  1u << ((sh | 1) & 0x1f) |
+				  1u << (((sh | 1) & 0x1f) | 2);
+
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				       comp->regs_pa + 0x2d8, 0, msk);
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				       comp->regs_pa + 0x2dc, 0,
+				       3u << ((sh | 3) & 0x1f) |
+				       3u << (sh & 0x1f));
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				       comp->regs_pa + 0x2d8, 0, msk);
+		}
 	}
 }
 
@@ -915,6 +989,9 @@ static unsigned int ovl_fmt_convert(struct mtk_disp_ovl *ovl, unsigned int fmt,
 	case DRM_FORMAT_YUYV:
 		return OVL_CON_CLRFMT_YUYV(ovl);
 	case DRM_FORMAT_ABGR2101010:
+		/* A12: 10-bit surfaces use the same RGBA8888 | BYTE_SWAP
+		 * CON as 8-bit (runtime value 0x1002000 = bit24 + RGBA8888)
+		 * with fmt_ex=1 in CLRFMT_EXT selecting the 10-bit mode. */
 		if (modifier & MTK_FMT_PREMULTIPLIED)
 			return OVL_CON_CLRFMT_ARGB8888 | OVL_CON_CLRFMT_MAN |
 			       OVL_CON_RGB_SWAP;
@@ -1466,6 +1543,7 @@ static void mtk_ovl_layer_config(struct mtk_ddp_comp *comp, unsigned int idx,
 		lye_idx = idx;
 	DDPINFO("%s+ idx:%d lye_idx:%d, enable:%d, fmt:0x%x\n", __func__, idx,
 		lye_idx, pending->enable, pending->format);
+
 	if (!pending->enable)
 		mtk_ovl_layer_off(comp, lye_idx, ext_lye_idx, handle);
 
@@ -1989,6 +2067,16 @@ static bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
 		if (src_y_align != src_y_half_align)
 			lx_2nd_subbuf = 1;
 	}
+
+	/* MTKDBG v186: clamp tile_offset. A degenerate src rect (w < tile_w
+	 * or h < tile_h) underflows the u32 math above and wraps
+	 * tile_offset to ~0xffffd800; lx_hdr_addr = addr + tile_offset*16
+	 * then lands 0x28000 BELOW the buffer (FAULT_DUMP: HDR_ADDR =
+	 * ADDR - 0x28000) -> L0_OVL_RDMA0_HDR translation fault + EMI MPU
+	 * violation -> pipeline death on resume. Clamp to the valid header
+	 * range so the HDR read always stays inside the mapped buffer. */
+	if (tile_offset > src_buf_tile_num)
+		tile_offset = 0;
 
 	/* 3. cal OVL_LX_ADDR * OVL_LX_PITCH */
 	lx_addr = buf_addr + tile_offset * tile_body_size;
@@ -3208,7 +3296,6 @@ static void mtk_ovl_prepare(struct mtk_ddp_comp *comp)
 #if defined(CONFIG_DRM_MTK_SHADOW_REGISTER_SUPPORT)
 	struct mtk_disp_ovl *ovl = comp_to_ovl(comp);
 #endif
-	struct mtk_drm_private *dev_priv = NULL;
 
 	mtk_ddp_comp_clk_prepare(comp);
 
@@ -3237,8 +3324,10 @@ static void mtk_ovl_prepare(struct mtk_ddp_comp *comp)
 #endif
 #endif
 
-	dev_priv = comp->mtk_crtc->base.dev->dev_private;
-	if (mtk_drm_helper_get_opt(dev_priv->helper_opt, MTK_DRM_OPT_LAYER_REC))
+	/* A12: GDRDY_PRD set unconditionally when DSI0 is in path
+	 * (not gated by MTK_DRM_OPT_LAYER_REC helper option)
+	 */
+	if (mtk_crtc_dsi0_in_path(comp->mtk_crtc))
 		writel(0xffffffff, comp->regs + DISP_OVL_REG_GDRDY_PRD);
 }
 
@@ -3266,15 +3355,13 @@ mtk_ovl_config_trigger(struct mtk_ddp_comp *comp, struct cmdq_pkt *pkt,
 		const int lnr = mtk_ovl_layer_num(comp);
 		u32 ln_con = 0, ln_size = 0;
 
-		struct mtk_drm_private *priv = NULL;
-
 		if (!comp->mtk_crtc)
 			return;
 
-		priv = comp->mtk_crtc->base.dev->dev_private;
-		if (!mtk_drm_helper_get_opt(priv->helper_opt,
-					   MTK_DRM_OPT_LAYER_REC))
-			return;
+		/* A12: LAYER_REC is unconditional, not gated by
+		 * MTK_DRM_OPT_LAYER_REC helper option; the caller
+		 * (mtk_crtc_dsi0_in_path) gates by path DSI0.
+		 */
 
 		if (comp->id == DDP_COMPONENT_OVL0_2L)
 			offset = DISP_SLOT_LAYER_REC_OVL0_2L;

@@ -59,7 +59,8 @@ struct drm_mode_object {
 	void (*free_cb)(struct kref *kref);
 };
 
-#define DRM_OBJECT_MAX_PROPERTY 24
+/* A12 hwcomposer requires 26 crtc props (3 std + 23 MTK); 24 overflows */
+#define DRM_OBJECT_MAX_PROPERTY 32
 /**
  * struct drm_object_properties - property tracking for &drm_mode_object
  */

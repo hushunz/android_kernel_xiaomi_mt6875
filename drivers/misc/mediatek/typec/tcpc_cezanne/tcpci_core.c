@@ -444,7 +444,11 @@ static int tcpc_device_irq_enable(struct tcpc_device *tcpc)
 	}
 
 	tcpci_lock_typec(tcpc);
-	ret = tcpc_typec_init(tcpc, tcpc->desc.role_def + 1);
+	/* A12 stock (逆向/kernel.elf) passes role_def directly; the +1
+	 * here pushed role 5 (TrySNK, mt-tcpc,role_def=<0x05>) past
+	 * TYPEC_ROLE_NR and made tcpc_typec_init fail -> no USB/adb.
+	 */
+	ret = tcpc_typec_init(tcpc, tcpc->desc.role_def);
 	tcpci_unlock_typec(tcpc);
 	if (ret < 0) {
 		pr_err("%s : tcpc typec init fail\n", __func__);

@@ -40,6 +40,9 @@
 #endif
 #include "mtk_lpae.h"
 #include "mtk_secure_api.h"
+
+/* MTKDBG v78: exported by drivers/gpu/drm/mediatek/mtk_drm_crtc.c */
+extern void mtk_drm_dbg_dump_ovl_layers(unsigned long fault_iova);
 #include "io-pgtable.h"
 #include "mtk_iommu.h"
 #include "mach/mt_iommu.h"
@@ -1544,7 +1547,13 @@ static irqreturn_t mtk_iommu_isr(int irq, void *dev_id)
 			mtk_iommu_atf_call(IOMMU_ATF_BANK_DUMP_INFO,
 					m4uid, bankid + 1);
 #endif
-		m4u_dump_pgtable(1, fault_iova);
+		/*
+		 * MTKDBG v78: do not dump the whole iova space from hardirq -
+		 * it stalls the display pipeline (GCE/RDMA/vsync IRQs starved)
+		 * and turns a single fault into a fatal cascade.
+		 * Dump current OVL layer mva instead to locate the faulted buffer.
+		 */
+		mtk_drm_dbg_dump_ovl_layers(fault_iova);
 	}
 
 	if (int_state &

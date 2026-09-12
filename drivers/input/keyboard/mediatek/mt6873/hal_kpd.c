@@ -233,6 +233,9 @@ void long_press_dump(unsigned long pressed)
 
 void kpd_pmic_pwrkey_hal(unsigned long pressed)
 {
+	/* Power key panic feature removed as requested */
+	/* Use volume up long press instead */
+
 #ifdef CONFIG_LONG_POWERKEY_LOG_STORE
 	struct task_struct *hd_thread;
 #endif

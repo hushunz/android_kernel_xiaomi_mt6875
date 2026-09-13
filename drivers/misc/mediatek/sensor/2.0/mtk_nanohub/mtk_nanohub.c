@@ -1805,7 +1805,7 @@ static void mtk_nanohub_restoring_sensor(int sensor_id)
 	}
 }
 
-static void mtk_nanohub_get_devinfo(void)
+static void __maybe_unused mtk_nanohub_get_devinfo(void)
 {
 	struct mtk_nanohub_device *dev = mtk_nanohub_dev;
 	bool find_sensor = true;

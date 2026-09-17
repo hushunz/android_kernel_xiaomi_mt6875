@@ -2730,31 +2730,15 @@ static void mtk_crtc_cmdq_timeout_cb(struct cmdq_cb_data data)
 		return;
 	}
 
-	/* The loop is stuck on WFE(FRAME_DONE=57) after an IOMMU fault
-	 * left DSI BUSY waiting for data that never arrived. Reset the
-	 * DSI engine on every timeout so that once SF feeds fresh
-	 * buffers the next trigger completes and the loop recovers.
+	/* A12 stock kernel and the MTK6873 A12 drop behave identically here:
+	 * the timeout callback only dumps state and reports to AEE. Every
+	 * "recovery" on top of that is self-inflicted - resetting the DSI
+	 * engine or poking CMD_EOF/STREAM_* while the panel is powering up
+	 * desyncs the DSI (v205/v209 regressions: SCREEN_OFF ANR, then the
+	 * panel stays dark). The loop is restarted by the enable path and
+	 * the next commit heals the layer, so just report and dump.
 	 */
-	{
-		struct mtk_ddp_comp *dsi_comp =
-			priv->ddp_comp[DDP_COMPONENT_DSI0];
-
-		if (dsi_comp && dsi_comp->funcs &&
-		    dsi_comp->funcs->io_cmd)
-			dsi_comp->funcs->io_cmd(dsi_comp, NULL,
-						CONNECTOR_RESET, NULL);
-	}
-
-	/* v201: the cmdq main thread is stuck waiting for STREAM_EOF(641)
-	 * of the faulted frame; wake it so queued commits drain and the
-	 * restarted trig loop can get new DIRTY events again. */
-	mtk_crtc_force_set_stream_events(crtc);
-
-	/* v212: the loop itself may be parked on wfe(CMD_EOF) - the faulted
-	 * frame never completes on its own (TFRP does not absorb it on this
-	 * HW, v211). With the DSI just reset above, completing the frame
-	 * token lets the loop cycle instead of staying parked. */
-	mtk_crtc_complete_faulted_frame(crtc);
+	DDPAEE("%s cmdq timeout, crtc id:%d\n", __func__, drm_crtc_index(crtc));
 
 	/* MTKDBG v144: dump the CFG client thread too - when the loop was
 	 * already stopped (handle==NULL) the loop-only dump below prints

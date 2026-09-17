@@ -259,6 +259,38 @@ static inline struct mtk_disp_rdma *comp_to_rdma(struct mtk_ddp_comp *comp)
 	return container_of(comp, struct mtk_disp_rdma, ddp_comp);
 }
 
+/* 推一次 present fence 释放。
+ *
+ * 官核是在 RDMA frame_start 中断里做这件事的（kernel.elf
+ * mtk_disp_rdma_irq_handler @0xffffff8008839988：is_frame_trigger_mode
+ * 判断 -> DOZE_ACTIVE 判断 -> pf_event=1 -> wake_up）。但那一刻 GCE
+ * 可能还没把新的 idx 写进 DISP_SLOT_PRESENT_FENCE，
+ * mtk_release_present_fence() 会因为 fence_increment <= 0 直接跳过，
+ * 于是这个 fence 永远不 signal，两种表现都出现过：
+ *   - hwcomposer: "[OVL-PF] (0) fence N didn't signal in 200 ms"
+ *     -> bootanimation QUEUE_BUFFER_TIMEOUT -> AAL 灭屏（黑屏）
+ *   - SurfaceFlinger: "waitForever: waiting for HWC release 3" 3000ms
+ *     -> BLASTSyncEngine 的 transaction 收不到 commit callback（画面卡死）
+ * 所以 frame_start 和 frame_done 各推一次。释放函数自带去重
+ * （fence_increment <= 0 会跳回），重复唤醒不会重复释放。
+ */
+static void mtk_disp_rdma_release_present_fence(struct mtk_drm_crtc *mtk_crtc)
+{
+	struct mtk_crtc_state *state;
+
+	if (!mtk_crtc || !mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base))
+		return;
+
+	state = to_mtk_crtc_state(mtk_crtc->base.state);
+	if (!state || state->prop_val[CRTC_PROP_DOZE_ACTIVE])
+		return;
+
+	atomic_set(&mtk_crtc->pf_event, 1);
+	wake_up_interruptible(&mtk_crtc->present_fence_wq);
+	atomic_set(&mtk_crtc->sf_pf_event, 1);
+	wake_up_interruptible(&mtk_crtc->sf_present_fence_wq);
+}
+
 static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
 {
 	struct mtk_disp_rdma *priv = dev_id;
@@ -311,6 +343,9 @@ static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
 					   1);
 		}
 		mtk_drm_refresh_tag_end(&priv->ddp_comp);
+
+		/* 第二道：帧结束时再推一次 present fence */
+		mtk_disp_rdma_release_present_fence(mtk_crtc);
 	}
 
 	if (val & (1 << 1)) {
@@ -318,34 +353,8 @@ static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
 		mtk_drm_refresh_tag_start(&priv->ddp_comp);
 		MMPathTraceDRM(rdma);
 
-		/* Stock A12 releases the present fence *here*, on frame start,
-		 * and only in frame-trigger (CMD) mode: the next frame starting
-		 * means the previous one has been scanned out, so SF may free
-		 * its buffer. The release is skipped while DOZE_ACTIVE.
-		 * (kernel.elf mtk_disp_rdma_irq_handler @0xffffff8008839988:
-		 * bl mtk_crtc_is_frame_trigger_mode / tbz w0,#0 -> skip /
-		 * ldr w8,[state,#0x2a4] / cbnz -> skip / str w8,[crtc,#0xf88] /
-		 * bl __wake_up_common_lock. Same shape in the MTK6873 A12
-		 * source, rdma.c IRQ handler.)
-		 *
-		 * Releasing on frame_done instead (what this tree did) leaves
-		 * the fence unsignalled on a CMD panel: hwcomposer logs
-		 * "[OVL-PF] fence N didn't signal in 200 ms", AtomicCommit
-		 * stalls at ~850ms, bootanimation hits QUEUE_BUFFER_TIMEOUT and
-		 * AAL blanks the panel (screen state 3(On) -> 0(Off)). */
-		if (mtk_crtc && mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
-			struct mtk_crtc_state *state =
-				to_mtk_crtc_state(mtk_crtc->base.state);
-
-			if (state && !state->prop_val[CRTC_PROP_DOZE_ACTIVE]) {
-				atomic_set(&mtk_crtc->pf_event, 1);
-				wake_up_interruptible(
-					&mtk_crtc->present_fence_wq);
-				atomic_set(&mtk_crtc->sf_pf_event, 1);
-				wake_up_interruptible(
-					&mtk_crtc->sf_present_fence_wq);
-			}
-		}
+		/* 官核的时机：frame start（见 helper 上方说明） */
+		mtk_disp_rdma_release_present_fence(mtk_crtc);
 	}
 
 	if (val & (1 << 3)) {

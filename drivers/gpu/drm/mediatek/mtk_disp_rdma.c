@@ -311,26 +311,41 @@ static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
 					   1);
 		}
 		mtk_drm_refresh_tag_end(&priv->ddp_comp);
-
-		/* Release the present fence on frame_done: the RDMA has
-		 * finished reading this frame's buffers, so SF may free
-		 * them. Releasing on frame_start (previous experiment) let
-		 * SF free the buffer while OVL still held the layer config
-		 * for the next scanout -> IOMMU fault (HDR_ADDR protect
-		 * page) + fault-recovery loop on screen on.
-		 */
-		if (mtk_crtc) {
-			atomic_set(&mtk_crtc->pf_event, 1);
-			wake_up_interruptible(&mtk_crtc->present_fence_wq);
-			atomic_set(&mtk_crtc->sf_pf_event, 1);
-			wake_up_interruptible(&mtk_crtc->sf_present_fence_wq);
-		}
 	}
 
 	if (val & (1 << 1)) {
 		DDPIRQ("[IRQ] %s: frame start!\n", mtk_dump_comp_str(rdma));
 		mtk_drm_refresh_tag_start(&priv->ddp_comp);
 		MMPathTraceDRM(rdma);
+
+		/* Stock A12 releases the present fence *here*, on frame start,
+		 * and only in frame-trigger (CMD) mode: the next frame starting
+		 * means the previous one has been scanned out, so SF may free
+		 * its buffer. The release is skipped while DOZE_ACTIVE.
+		 * (kernel.elf mtk_disp_rdma_irq_handler @0xffffff8008839988:
+		 * bl mtk_crtc_is_frame_trigger_mode / tbz w0,#0 -> skip /
+		 * ldr w8,[state,#0x2a4] / cbnz -> skip / str w8,[crtc,#0xf88] /
+		 * bl __wake_up_common_lock. Same shape in the MTK6873 A12
+		 * source, rdma.c IRQ handler.)
+		 *
+		 * Releasing on frame_done instead (what this tree did) leaves
+		 * the fence unsignalled on a CMD panel: hwcomposer logs
+		 * "[OVL-PF] fence N didn't signal in 200 ms", AtomicCommit
+		 * stalls at ~850ms, bootanimation hits QUEUE_BUFFER_TIMEOUT and
+		 * AAL blanks the panel (screen state 3(On) -> 0(Off)). */
+		if (mtk_crtc && mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
+			struct mtk_crtc_state *state =
+				to_mtk_crtc_state(mtk_crtc->base.state);
+
+			if (state && !state->prop_val[CRTC_PROP_DOZE_ACTIVE]) {
+				atomic_set(&mtk_crtc->pf_event, 1);
+				wake_up_interruptible(
+					&mtk_crtc->present_fence_wq);
+				atomic_set(&mtk_crtc->sf_pf_event, 1);
+				wake_up_interruptible(
+					&mtk_crtc->sf_present_fence_wq);
+			}
+		}
 	}
 
 	if (val & (1 << 3)) {

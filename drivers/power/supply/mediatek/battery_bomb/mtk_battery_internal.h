@@ -106,7 +106,13 @@ do {\
 	}						\
 } while (0)
 
-#define BM_DAEMON_DEFAULT_LOG_LEVEL 3
+/* 3 会把 daemon 通信全部压掉（bm_err 要 >=3、bm_debug 要 >=7），而官核
+ * 运行时 daemon 报的是 "MTK_BH: get_daemon_log_level 8" —— 也就是整套
+ * A12/A15 用户空间都是按 8 在跑。这里对齐成 8 才能看见
+ * [fr] FG_DAEMON_CMD_* / notify daemon / netlink 收发，
+ * 否则 bring-up 期间 dmesg 里 gauge 一片死寂，无从判断。
+ * 定位完成后可以降回 3。 */
+#define BM_DAEMON_DEFAULT_LOG_LEVEL 8
 
 enum gauge_hw_version {
 	GAUGE_HW_V1000 = 1000,

@@ -2960,6 +2960,44 @@ void bmd_ctrl_cmd_from_user(void *nl_data, struct fgd_nl_msg_t *ret_msg)
 
 	switch (msg->fgd_cmd) {
 
+	/* A12/A13 追加的两个命令。daemon 每次算完容量都先发
+	 * SET_BATTERY_CAPACITY，紧接着才发 SET_KERNEL_UISOC/SOC（官核实测
+	 * 517.73s 就是这么一对）。A11 内核没有这两项时 daemon 判定
+	 * FG_DAEMON_CMD mismatch 并重启，永远走不到写 SOC 那一步。 */
+	case FG_DAEMON_CMD_SET_BATTERY_CAPACITY:
+		{
+			struct fgd_cmd_param_t_8 param;
+
+			memcpy(&param, &msg->fgd_data[0],
+				sizeof(struct fgd_cmd_param_t_8));
+
+			if (param.data[10] != 0 && param.data[11] != 0) {
+				gm.show_ag = param.data[10];
+				gm.bat_health = param.data[11];
+			}
+
+			gm.prev_batt_fcc = param.data[4];
+			gm.prev_batt_remaining_capacity =
+				param.data[4] / 10 * param.data[6] / 10000;
+			bm_debug(
+				"[fr] FG_DAEMON_CMD_SET_BATTERY_CAPACITY = %d %d %d %d %d %d %d %d %d %d RM:%d\n",
+				param.data[0], param.data[1], param.data[2],
+				param.data[3], param.data[4], param.data[5],
+				param.data[6], param.data[7], param.data[8],
+				param.data[9],
+				param.data[4] * param.data[6] / 10000);
+		}
+		break;
+
+	case FG_DAEMON_CMD_GET_BH_DATA:
+		{
+			ret_msg->fgd_data_len +=
+				sizeof(struct ag_center_data_st);
+			memcpy(ret_msg->fgd_data, &gm.bh_data,
+				sizeof(struct ag_center_data_st));
+		}
+		break;
+
 	case FG_DAEMON_CMD_IS_BAT_PLUGOUT:
 		{
 			int is_bat_plugout = 0;

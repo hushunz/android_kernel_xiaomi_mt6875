@@ -259,20 +259,21 @@ static inline struct mtk_disp_rdma *comp_to_rdma(struct mtk_ddp_comp *comp)
 	return container_of(comp, struct mtk_disp_rdma, ddp_comp);
 }
 
-/* 推一次 present fence 释放。
+/* 推一次 hwcomposer 用的 present fence。
  *
- * 官核是在 RDMA frame_start 中断里做这件事的（kernel.elf
- * mtk_disp_rdma_irq_handler @0xffffff8008839988：is_frame_trigger_mode
- * 判断 -> DOZE_ACTIVE 判断 -> pf_event=1 -> wake_up）。但那一刻 GCE
- * 可能还没把新的 idx 写进 DISP_SLOT_PRESENT_FENCE，
- * mtk_release_present_fence() 会因为 fence_increment <= 0 直接跳过，
- * 于是这个 fence 永远不 signal，两种表现都出现过：
- *   - hwcomposer: "[OVL-PF] (0) fence N didn't signal in 200 ms"
- *     -> bootanimation QUEUE_BUFFER_TIMEOUT -> AAL 灭屏（黑屏）
- *   - SurfaceFlinger: "waitForever: waiting for HWC release 3" 3000ms
- *     -> BLASTSyncEngine 的 transaction 收不到 commit callback（画面卡死）
- * 所以 frame_start 和 frame_done 各推一次。释放函数自带去重
- * （fence_increment <= 0 会跳回），重复唤醒不会重复释放。
+ * 三方一致的做法（官核 kernel.elf mtk_disp_rdma_irq_handler
+ * @0xffffff8008839988、A13 camellian、A12 MT6873）：只在 RDMA 的
+ * frame_start(bit1) 中断、且仅 CMD 模式、且非 DOZE_ACTIVE 时释放
+ * present fence，frame_done(bit2) 里不碰它。
+ *
+ * 这里只推 pf_event：sf_pf_event 是 SurfaceFlinger 那一条，A13 把它放在
+ * target_line(bit5) 并限定非 CMD(VDO) 模式，官核的 bit5 则完全不处理。
+ * 在 frame_start 里连 sf 一起推会打乱 SF 的 BLAST 同步，实测为画面卡死：
+ *   SurfaceFlinger: "waitForever: waiting for HWC release 3" 3000 ms
+ *   BLASTSyncEngine: WM sent Transaction ... but never received commit callback
+ * 而完全不推则表现为黑屏：
+ *   hwcomposer: "[OVL-PF] (0) fence N didn't signal in 200 ms"
+ *   -> bootanimation QUEUE_BUFFER_TIMEOUT -> AAL screen 3(On) -> 0(Off)
  */
 static void mtk_disp_rdma_release_present_fence(struct mtk_drm_crtc *mtk_crtc)
 {
@@ -287,8 +288,6 @@ static void mtk_disp_rdma_release_present_fence(struct mtk_drm_crtc *mtk_crtc)
 
 	atomic_set(&mtk_crtc->pf_event, 1);
 	wake_up_interruptible(&mtk_crtc->present_fence_wq);
-	atomic_set(&mtk_crtc->sf_pf_event, 1);
-	wake_up_interruptible(&mtk_crtc->sf_present_fence_wq);
 }
 
 static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
@@ -343,9 +342,6 @@ static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
 					   1);
 		}
 		mtk_drm_refresh_tag_end(&priv->ddp_comp);
-
-		/* 第二道：帧结束时再推一次 present fence */
-		mtk_disp_rdma_release_present_fence(mtk_crtc);
 	}
 
 	if (val & (1 << 1)) {
@@ -396,8 +392,20 @@ static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
 
 		priv->underflow_cnt++;
 	}
-	if (val & (1 << 5))
+	if (val & (1 << 5)) {
 		DDPIRQ("[IRQ] %s: target line!\n", mtk_dump_comp_str(rdma));
+
+		/* 照 A13 camellian：SurfaceFlinger 那条 present fence 在
+		 * target_line 释放，且只在非 CMD(VDO) 模式下 —— CMD 模式由别的
+		 * 路径处理，在这里推会打乱 SF 的 BLAST 同步。官核的 bit5 完全
+		 * 不处理，加这段是为了跟 A13 对齐（对 CMD 设备不生效）。 */
+		if (mtk_crtc &&
+		    !mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
+			atomic_set(&mtk_crtc->sf_pf_event, 1);
+			wake_up_interruptible(
+				&mtk_crtc->sf_present_fence_wq);
+		}
+	}
 
 	/* TODO: check if this is not necessary */
 	/* mtk_crtc_ddp_irq(priv->crtc, rdma); */

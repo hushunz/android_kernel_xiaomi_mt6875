@@ -3758,19 +3758,6 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 	struct cmdq_pkt *cmdq_handle;
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	unsigned long crtc_id = (unsigned long)drm_crtc_index(crtc);
-
-	DDPPR_ERR("MTKDBG START_TRIG_LOOP crtc=%ld\n", crtc_id);
-
-	/* Guard against double start: the loop can be (re)started from
-	 * crtc enable, from atomic_flush on a screen-on frame, or from the
-	 * DSI encoder enable - only the first one may create the pkt,
-	 * otherwise two loops run on GCE at once and double-trigger DSI
-	 * (display corruption / splash artifacts).
-	 */
-	if (mtk_crtc->trig_loop_cmdq_handle) {
-		DDPPR_ERR("MTKDBG START_TRIG_LOOP skip (running)\n");
-		return;
-	}
 #if defined(CONFIG_MACH_MT6873) || defined(CONFIG_MACH_MT6853) || \
 	defined(CONFIG_MACH_MT6833)
 	struct cmdq_operand lop, rop;
@@ -3787,6 +3774,19 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 	rop.reg = false;
 	rop.idx = var2;
 #endif
+
+	DDPPR_ERR("MTKDBG START_TRIG_LOOP crtc=%ld\n", crtc_id);
+
+	/* Guard against double start: the loop can be (re)started from
+	 * crtc enable, from atomic_flush on a screen-on frame, or from the
+	 * DSI encoder enable - only the first one may create the pkt,
+	 * otherwise two loops run on GCE at once and double-trigger DSI
+	 * (display corruption / splash artifacts).
+	 */
+	if (mtk_crtc->trig_loop_cmdq_handle) {
+		DDPPR_ERR("MTKDBG START_TRIG_LOOP skip (running)\n");
+		return;
+	}
 
 	if (crtc_id > 1) {
 		DDPPR_ERR("%s:%d invalid crtc:%ld\n",

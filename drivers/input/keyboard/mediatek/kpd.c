@@ -39,29 +39,8 @@ void __iomem *kp_base;
 /* Volume up long press panic debug feature */
 #define VOLUME_UP_LONG_PRESS_SECONDS	10
 static struct timer_list vol_up_long_press_timer;
-/* 最近一次被识别为按下的音量上键矩阵位置，-1 表示还没有过 */
-static int volup_hw_idx = -1;
-
 static void volup_long_press_panic(struct timer_list *t)
 {
-	u16 state[KPD_NUM_MEMS] = { 0 };
-	int idx = READ_ONCE(volup_hw_idx);
-	bool held = false;
-
-	/* 定时器到期时再确认一次按键状态：丢掉一次松开中断、或者把一次
-	 * 抖动误报成按下，都不该让系统 panic 掉。只有音量上确实还按着，
-	 * 才当成是要抓日志（bit 为 0 表示按下）。
-	 */
-	kpd_get_keymap_state(state);
-	if (idx >= 0 && idx < KPD_NUM_KEYS)
-		held = !(state[idx >> 4] & (1U << (idx & 0xF)));
-
-	if (!held) {
-		pr_emerg("Volume Up long press panic skipped: key not held (idx=%d)\n",
-			 idx);
-		return;
-	}
-
 	pr_emerg("Volume Up long press %d seconds: triggering kernel panic\n",
 		 VOLUME_UP_LONG_PRESS_SECONDS);
 	panic("Volume up long press panic triggered");
@@ -275,7 +254,6 @@ static void kpd_keymap_handler(unsigned long data)
 			/* Volume Up long press panic handling */
 			if (linux_keycode == KEY_VOLUMEUP && mtk_debug_volup_panic_enabled) {
 				if (pressed) {
-					WRITE_ONCE(volup_hw_idx, hw_keycode);
 					mod_timer(&vol_up_long_press_timer,
 						  jiffies + VOLUME_UP_LONG_PRESS_SECONDS * HZ);
 					kpd_print("Volume Up pressed, start %ds panic timer\n",

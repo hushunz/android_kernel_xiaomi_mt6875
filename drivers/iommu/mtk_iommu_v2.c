@@ -4179,7 +4179,19 @@ static int mtk_iommu_hw_init(struct mtk_iommu_data *data)
 
 	writel_relaxed(F_MMU_TFRP_PA_SET(data->protect_base, data->enable_4GB),
 		   data->base + REG_MMU_TFRP_PADDR);
-	// writel_relaxed(0, data->base + REG_MMU_DCM_DIS);
+	/* kernel.elf mtk_iommu_probe @0xffffff80087b2e68:
+	 *     mov  w9, #0x100
+	 *     add  x8, x8, #0x50        <- REG_MMU_DCM_DIS
+	 *     str  w9, [x8]
+	 * A12 MT6873 and A13 camellian write the same 0x100.  A11 left the
+	 * write commented out (and it was a 0, not 0x100), so the MMU kept
+	 * its dynamic clock gating on: under display load the hardware can
+	 * gate its own clock mid-translation and raise a TRANSLATION FAULT
+	 * for an iova that software still maps - exactly the signature seen
+	 * on the screenshot fault, where mtk_iommu_iova_to_phys() returned a
+	 * valid pa=0x639e0000 for the faulting iova=0xfda38000 while the
+	 * hardware reported ptbase=0x0. */
+	writel_relaxed(0x100, data->base + REG_MMU_DCM_DIS);
 
 	//writel_relaxed(0, data->base + REG_MMU_STANDARD_AXI_MODE);
 

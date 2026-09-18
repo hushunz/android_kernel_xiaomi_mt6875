@@ -41,6 +41,10 @@
 #include "mtk_layer_layout_trace.h"
 #include "mtk_drm_mmp.h"
 
+/* MTKDBG: current DISP MMCLK step, so an OVL/DSI starvation event can be
+ * told apart from a bandwidth shortage.  Exported by mmdvfs_pmqos.c. */
+extern u64 mmdvfs_qos_get_freq(u32 pm_qos_class);
+
 #define REG_FLD(width, shift)                                                  \
 	((unsigned int)((((width)&0xFF) << 16) | ((shift)&0xFF)))
 
@@ -639,6 +643,8 @@ static irqreturn_t mtk_disp_ovl_irq_handler(int irq, void *dev_id)
 			unsigned int i;
 
 			if (++uf_dump_cnt % 32 == 1) {
+				DDPPR_ERR("MTKDBG OVL2L underflow: DISP_MMCLK=%llu Hz\n",
+					  mmdvfs_qos_get_freq(PM_QOS_DISP_FREQ));
 				DDPPR_ERR("MTKDBG OVL2L DP_CON=0x%x\n",
 					  readl_relaxed(ovl->regs +
 						DISP_REG_OVL_DATAPATH_CON));

@@ -63,6 +63,13 @@
 #include "mtk_drm_fbdev.h"
 #include "mtk_fbconfig_kdebug.h"
 /* ********* end Panel Master *********** */
+
+#include <linux/pm_qos.h>
+
+/* MTKDBG: current DISP MMCLK step, so a DSI FIFO starvation can be told
+ * apart from a bandwidth shortage.  Exported by mmdvfs_pmqos.c. */
+extern u64 mmdvfs_qos_get_freq(u32 pm_qos_class);
+
 #define DSI_START 0x00
 #define SLEEPOUT_START BIT(2)
 #define VM_CMD_START BIT(16)
@@ -1648,6 +1655,27 @@ static irqreturn_t mtk_dsi_irq_status(int irq, void *dev_id)
 			if (__ratelimit(&ioctl_ratelimit))
 				pr_err(pr_fmt("[IRQ] %s: buffer underrun\n"),
 					mtk_dump_comp_str(&dsi->ddp_comp));
+
+			/* MTKDBG: report the DISP MMCLK step together with the
+			 * underrun, rate-limited to twice a second.  The FIFO
+			 * starves once per frame from the moment the display
+			 * comes up, and the one thing no existing log shows is
+			 * the DISP frequency at that instant - if it sits at a
+			 * low step the cause is a bandwidth shortage, if it is
+			 * already at the top step the DSI is being starved by
+			 * something else. */
+			{
+				static DEFINE_RATELIMIT_STATE(dsi_mmclk_ratelimit,
+							      1 * HZ, 2);
+				static unsigned int dsi_underrun_cnt;
+
+				dsi_underrun_cnt++;
+				if (__ratelimit(&dsi_mmclk_ratelimit))
+					pr_err("MTKDBG DSI underrun: cnt=%u DISP_MMCLK=%llu Hz\n",
+					       dsi_underrun_cnt,
+					       mmdvfs_qos_get_freq(
+							PM_QOS_DISP_FREQ));
+			}
 #else
 			DDPPR_ERR("[IRQ] %s: buffer underrun\n",
 				mtk_dump_comp_str(&dsi->ddp_comp));

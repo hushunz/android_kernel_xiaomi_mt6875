@@ -324,6 +324,20 @@ static void mtk_drm_set_mmclk(struct drm_crtc *crtc, int level,
 
 	DDPINFO("%s set mmclk level: %d\n", caller, g_freq_level);
 
+	/* MTKDBG DISP MMCLK request trace.
+	 *
+	 * This panel's pixel clock works out to ~177 MHz while the lowest
+	 * DISP step is 208 MHz, so mtk_drm_set_mmclk_by_pixclk() always
+	 * falls through to level -1 and the driver asks for 0 Hz, handing
+	 * the DISP frequency entirely to MMDVFS.  Whether the OVL/DSI
+	 * starvation happens at a low DISP step or at full speed is the one
+	 * thing the existing logs cannot show, so record every change.
+	 */
+	pr_err("MTKDBG MMCLK level=%d freq=%llu caller=%s\n",
+	       g_freq_level,
+	       g_freq_level >= 0 ? g_freq_steps[g_freq_level] : 0,
+	       caller);
+
 	if (g_freq_level >= 0)
 		pm_qos_update_request(&mm_freq_request,
 			g_freq_steps[g_freq_level]);

@@ -841,6 +841,10 @@ struct mtk_battery {
 	bool cmd_disable_nafg;
 	bool ntc_disable_nafg;
 
+/*battery full*/
+	bool is_force_full;
+	int charge_power_sel;
+
 /*battery plug out*/
 	bool disable_plug_int;
 /* hwocv swocv */

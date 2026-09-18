@@ -1414,7 +1414,7 @@ static void dump_daemon_table(struct seq_file *m)
 				ptr[i].mah,
 				ptr[i].voltage,
 				ptr[i].resistance,
-				ptr[i].resistance2,
+				ptr[i].charge_r.rdc[0],
 				ptr[i].percentage);
 		}
 	}
@@ -1429,7 +1429,7 @@ static void dump_daemon_table(struct seq_file *m)
 			ptr[i].mah,
 			ptr[i].voltage,
 			ptr[i].resistance,
-			ptr[i].resistance2,
+			ptr[i].charge_r.rdc[0],
 			ptr[i].percentage);
 
 	}
@@ -1444,7 +1444,7 @@ static void dump_daemon_table(struct seq_file *m)
 			ptr[i].mah,
 			ptr[i].voltage,
 			ptr[i].resistance,
-			ptr[i].resistance2,
+			ptr[i].charge_r.rdc[0],
 			ptr[i].percentage);
 	}
 
@@ -1492,7 +1492,7 @@ static void dump_kernel_table(struct seq_file *m)
 				ptr[i].mah,
 				ptr[i].voltage,
 				ptr[i].resistance,
-				ptr[i].resistance2,
+				ptr[i].charge_r.rdc[0],
 				ptr[i].percentage);
 		}
 	}
@@ -1511,7 +1511,7 @@ static void dump_kernel_table(struct seq_file *m)
 				ptr[i].mah,
 				ptr[i].voltage,
 				ptr[i].resistance,
-				ptr[i].resistance2,
+				ptr[i].charge_r.rdc[0],
 				ptr[i].percentage);
 		}
 	}

@@ -880,8 +880,8 @@ void fg_custom_init_from_header(void)
 			g_SHUTDOWN_HL_ZCV[i][gm.battery_id];
 
 		for (j = 0; j < 100; j++)
-			if (p[j].resistance2 == 0)
-				p[j].resistance2 = p[j].resistance;
+			if (p[j].charge_r.rdc[0] == 0)
+				p[j].charge_r.rdc[0] = p[j].resistance;
 
 	}
 
@@ -944,7 +944,9 @@ static void fg_custom_parse_table(const struct device_node *np,
 		const char *node_srting,
 		struct FUELGAUGE_PROFILE_STRUCT *profile_struct, int column)
 {
-	int mah, voltage, resistance, idx, saddles, resistance2;
+	int mah, voltage, resistance, idx, saddles;
+	int i = 0, charge_rdc[MAX_CHARGE_RDC];
+
 	struct FUELGAUGE_PROFILE_STRUCT *profile_p;
 
 	profile_p = profile_struct;
@@ -966,20 +968,37 @@ static void fg_custom_parse_table(const struct device_node *np,
 				np, node_srting, idx, &resistance)) {
 		}
 		idx++;
-		if (column == 4) {
-			if (!of_property_read_u32_index(
-				np, node_srting, idx, &resistance2))
-				idx++;
-		} else
-			resistance2 = resistance;
 
-		bm_debug("%s: mah: %d, voltage: %d, resistance: %d, resistance2: %d\n",
-			__func__, mah, voltage, resistance, resistance2);
+
+		if (column == 3) {
+			for (i = 0; i < MAX_CHARGE_RDC; i++)
+				charge_rdc[i] = resistance;
+		} else if (column >= 4) {
+			if (!of_property_read_u32_index(
+				np, node_srting, idx, &charge_rdc[0]))
+				idx++;
+		}
+
+		/* read more for column >4 case */
+		if (column > 4) {
+			for (i = 1; i <= column - 4; i++) {
+				if (!of_property_read_u32_index(
+					np, node_srting, idx, &charge_rdc[i]))
+					idx++;
+			}
+		}
+
+		bm_debug("%s: mah: %d, voltage: %d, resistance: %d, rdc0:%d rdc:%d %d %d %d\n",
+			__func__, mah, voltage, resistance, charge_rdc[0],
+			charge_rdc[1], charge_rdc[2], charge_rdc[3], charge_rdc[4]);
 
 		profile_p->mah = mah;
 		profile_p->voltage = voltage;
 		profile_p->resistance = resistance;
-		profile_p->resistance2 = resistance2;
+
+		for (i = 0; i < MAX_CHARGE_RDC; i++)
+			profile_p->charge_r.rdc[i] = charge_rdc[i];
+
 
 		profile_p++;
 
@@ -999,7 +1018,9 @@ static void fg_custom_parse_table(const struct device_node *np,
 		profile_p->mah = mah;
 		profile_p->voltage = voltage;
 		profile_p->resistance = resistance;
-		profile_p->resistance2 = resistance2;
+		for (i = 0; i < MAX_CHARGE_RDC; i++)
+			profile_p->charge_r.rdc[i] = charge_rdc[i];
+
 		idx = idx + column;
 	}
 }
@@ -1412,8 +1433,8 @@ void fg_custom_init_from_dts(struct platform_device *dev)
 			i*TOTAL_BATTERY_NUMBER+gm.battery_id,
 			&(fg_table_cust_data.fg_profile[i].shutdown_hl_zcv), 1);
 		for (j = 0; j < 100; j++) {
-			if (p[j].resistance2 == 0)
-				p[j].resistance2 = p[j].resistance;
+			if (p[j].charge_r.rdc[0] == 0)
+				p[j].charge_r.rdc[0] = p[j].resistance;
 		}
 	}
 
@@ -2838,6 +2859,36 @@ void fg_daemon_comm_INT_data(char *rcv, char *ret)
 
 			memcpy(&pret->output,
 				&soc_setting, sizeof(soc_setting));
+		}
+		break;
+	case FG_GET_IS_FORCE_FULL:
+		{
+			/* 1 = trust customer full condition */
+			/* 0 = using gauge ori full flow */
+			int force_full = gm.is_force_full;
+
+			memcpy(&pret->output,
+				&force_full, sizeof(force_full));
+		}
+		break;
+	case FG_GET_ZCV_INTR_CURR:
+		{
+			int zcv_cur = 0;
+
+			gauge_get_zcv_current(&zcv_cur);
+			memcpy(&pret->output,
+				&zcv_cur, sizeof(zcv_cur));
+
+			bm_err("get FG_GET_ZCV_INTR_CURR %d\n", zcv_cur);
+		}
+		break;
+	case FG_GET_CHARGE_POWER_SEL:
+		{
+			int charge_power_sel = gm.charge_power_sel;
+
+			memcpy(&pret->output,
+				&charge_power_sel, sizeof(charge_power_sel));
+			bm_err("charge_power_sel = %d\n", charge_power_sel);
 		}
 		break;
 	case FG_SET_SOC:

@@ -3312,12 +3312,25 @@ static void ddp_cmdq_cb(struct cmdq_cb_data data)
 	}
 	CRTC_MMP_MARK(id, frame_cfg, ovl_status, 0);
 
-	/* Present fence is released on RDMA frame_start only (A12
-	 * kernel.elf mtk_disp_rdma_isr) - releasing here (flush done)
-	 * signals the SF while the OVL still holds the previous layer
-	 * config for the next scanout, so the SF frees a buffer the OVL
-	 * is about to read -> IOMMU fault (L0_OVL_RDMA0_HDR) + pipeline
-	 * death. No fence release in ddp_cmdq_cb, exactly like A12. */
+	/* Present fence in VDO mode.  This panel is a video-mode panel, so
+	 * mtk_crtc_is_frame_trigger_mode() is false and the RDMA frame_start
+	 * path (pf_event -> pf_release_thread) never fires the present
+	 * fence.  It then stays unsignalled forever and hwcomposer spins on
+	 * "[OVL-PF] fence N didn't signal in 200 ms" until the UI freezes
+	 * (Keyguard draw timeout).  A12 kernel.elf ddp_cmdq_cb() calls
+	 * mtk_release_present_fence() right here, guarded by "id != 2" and
+	 * !mtk_crtc_is_frame_trigger_mode(); A13 camellian carries the same
+	 * block, commented "only VDO mode panel use CMDQ call".  The CMD
+	 * mode release path through the RDMA ISR is left untouched.
+	 */
+	if (id != 2) {
+		struct cmdq_pkt_buffer *cmdq_buf = &(mtk_crtc->gce_obj.buf);
+		unsigned int fence_idx = *(unsigned int *)(cmdq_buf->va_base +
+				DISP_SLOT_PRESENT_FENCE(id));
+
+		if (mtk_crtc && !mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base))
+			mtk_release_present_fence(session_id, fence_idx);
+	}
 
 	mtk_crtc_release_input_layer_fence(crtc, session_id);
 

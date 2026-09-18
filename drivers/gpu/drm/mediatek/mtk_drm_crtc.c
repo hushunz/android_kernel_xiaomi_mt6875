@@ -3312,16 +3312,25 @@ static void ddp_cmdq_cb(struct cmdq_cb_data data)
 	}
 	CRTC_MMP_MARK(id, frame_cfg, ovl_status, 0);
 
-	/* Present fence in VDO mode.  This panel is a video-mode panel, so
-	 * mtk_crtc_is_frame_trigger_mode() is false and the RDMA frame_start
-	 * path (pf_event -> pf_release_thread) never fires the present
-	 * fence.  It then stays unsignalled forever and hwcomposer spins on
-	 * "[OVL-PF] fence N didn't signal in 200 ms" until the UI freezes
-	 * (Keyguard draw timeout).  A12 kernel.elf ddp_cmdq_cb() calls
-	 * mtk_release_present_fence() right here, guarded by "id != 2" and
-	 * !mtk_crtc_is_frame_trigger_mode(); A13 camellian carries the same
-	 * block, commented "only VDO mode panel use CMDQ call".  The CMD
-	 * mode release path through the RDMA ISR is left untouched.
+	mtk_crtc_release_input_layer_fence(crtc, session_id);
+
+	if (session_id > 0)
+		mtk_crtc_release_input_layer_fence(crtc, session_id);
+
+	/* Present fence in VDO mode, released *after* the input layer fence
+	 * exactly as A13 camellian and A12 kernel.elf order it.  Signalling
+	 * the present fence first hands the buffer back to hwcomposer before
+	 * the input layer fence retires, and OVL keeps reading a buffer
+	 * whose mapping is being torn down: mtk_iommu_isr then reports a
+	 * fault_iova on larb0/port1 (M4U_PORT_L0_OVL_RDMA0_HDR) together
+	 * with "L not complete until EOF" and "frame underflow" - the
+	 * garbled / torn / black picture.
+	 *
+	 * This panel is a video-mode panel, so mtk_crtc_is_frame_trigger_mode()
+	 * is false and the RDMA frame_start path (pf_event -> pf_release_thread)
+	 * never fires the present fence; without this block it would never be
+	 * signalled and the UI freezes (Keyguard draw timeout).  The CMD-mode
+	 * path through the RDMA ISR is left untouched.
 	 */
 	if (id != 2) {
 		struct cmdq_pkt_buffer *cmdq_buf = &(mtk_crtc->gce_obj.buf);
@@ -3331,11 +3340,6 @@ static void ddp_cmdq_cb(struct cmdq_cb_data data)
 		if (mtk_crtc && !mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base))
 			mtk_release_present_fence(session_id, fence_idx);
 	}
-
-	mtk_crtc_release_input_layer_fence(crtc, session_id);
-
-	if (session_id > 0)
-		mtk_crtc_release_input_layer_fence(crtc, session_id);
 
 	DDP_MUTEX_LOCK(&mtk_crtc->lock, __func__, __LINE__);
 	if (!mtk_crtc_is_dc_mode(crtc) && session_id > 0)

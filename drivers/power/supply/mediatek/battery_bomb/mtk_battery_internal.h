@@ -42,6 +42,7 @@
 #define UNIT_TRANS_60 60
 
 #define MAX_TABLE 10
+#define MAX_CHARGE_RDC 5
 
 /* ============================================================ */
 /* power misc related */
@@ -246,6 +247,8 @@ enum Fg_kernel_cmds {
 	FG_KERNEL_CMD_REQ_CHANGE_AGING_DATA,
 	FG_KERNEL_CMD_AG_LOG_TEST,
 	FG_KERNEL_CMD_CHG_DECIMAL_RATE,
+	FG_KERNEL_CMD_FORCE_BAT_TEMP,
+	FG_KERNEL_CMD_SEND_BH_DATA,
 
 	FG_KERNEL_CMD_FROM_USER_NUMBER
 
@@ -332,6 +335,9 @@ enum daemon_cmd_int_data {
 	FG_GET_IS_AGING_RESET = 6,
 	FG_GET_SOC_DECIMAL_RATE = 7,
 	FG_GET_DIFF_SOC_SET = 8,
+	FG_GET_IS_FORCE_FULL = 9,
+	FG_GET_ZCV_INTR_CURR = 10,
+	FG_GET_CHARGE_POWER_SEL = 11,
 	FG_GET_MAX,
 	FG_SET_ANCHOR = 999,
 	FG_SET_SOC = FG_SET_ANCHOR + 1,
@@ -496,6 +502,7 @@ struct fuel_gauge_custom_data {
 	/* ZCV update */
 	int zcv_suspend_time;
 	int sleep_current_avg;
+	int zcv_com_vol_limit;
 
 	int dc_ratio_sel;
 	int dc_r_cnt;
@@ -515,6 +522,17 @@ struct fuel_gauge_custom_data {
 	int ui_full_limit_soc4;
 	int ui_full_limit_ith4;
 	int ui_full_limit_time;
+
+	int ui_full_limit_fc_soc0;
+	int ui_full_limit_fc_ith0;
+	int ui_full_limit_fc_soc1;
+	int ui_full_limit_fc_ith1;
+	int ui_full_limit_fc_soc2;
+	int ui_full_limit_fc_ith2;
+	int ui_full_limit_fc_soc3;
+	int ui_full_limit_fc_ith3;
+	int ui_full_limit_fc_soc4;
+	int ui_full_limit_fc_ith4;
 
 	/* using voltage to limit uisoc in 1% case */
 	int ui_low_limit_en;
@@ -566,6 +584,22 @@ struct fuel_gauge_custom_data {
 	int power_on_car_nochr;
 	int shutdown_car_ratio;
 
+	/* battery health */
+	int aging_diff_max_threshold;
+	int aging_diff_max_level;
+	int aging_factor_t_min;
+	int cycle_diff;
+	int aging_count_min;
+	int default_score;
+	int default_score_quantity;
+	int fast_cycle_set;
+	int level_max_change_bat;
+	int diff_max_change_bat;
+	int aging_tracking_start;
+	int max_aging_data;
+	int max_fast_data;
+	int fast_data_threshold_score;
+
 	/* log_level */
 	int daemon_log_level;
 	int record_log;
@@ -587,12 +621,23 @@ struct FUELGAUGE_TEMPERATURE {
 	signed int TemperatureR;
 };
 
+/* A12/A13 追加：daemon 会按 sizeof() 校验表结构（14820 -> 39020、664 -> 764），
+ * 缺这些字段时它判定 "FG Version not match" 后反复重启，SOC 永远写不进
+ * 内核（电量恒为 -1）。字段名与顺序照 A13 camellian 逐字对齐。 */
+struct FUELGAUGE_CHARGER_STRUCT {
+	int rdc[MAX_CHARGE_RDC];
+};
+
+struct FUELGAUGE_CHARGE_PSEUDO100_S {
+	int pseudo[MAX_CHARGE_RDC];
+};
+
 struct FUELGAUGE_PROFILE_STRUCT {
 	unsigned int mah;
 	unsigned short voltage;
 	unsigned short resistance; /* Ohm*/
-	unsigned short resistance2; /* Ohm*/
-	unsigned short percentage;
+	unsigned int percentage;
+	struct FUELGAUGE_CHARGER_STRUCT charge_r;
 };
 
 struct fuel_gauge_table {
@@ -607,6 +652,7 @@ struct fuel_gauge_table {
 	int shutdown_hl_zcv;
 
 	int size;
+	struct FUELGAUGE_CHARGE_PSEUDO100_S r_pseudo100;
 	struct FUELGAUGE_PROFILE_STRUCT fg_profile[100];
 };
 

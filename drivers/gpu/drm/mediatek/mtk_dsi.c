@@ -1447,35 +1447,34 @@ static void mtk_dsi_cmdq_poll(struct mtk_ddp_comp *comp,
 			      struct cmdq_pkt *handle, unsigned int reg,
 			      unsigned int val, unsigned int mask)
 {
-	if (handle == NULL)
+	struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
+	struct cmdq_client *client = mtk_crtc->gce_obj.client[CLIENT_DSI_CFG];
+
+	if (handle == NULL) {
 		DDPPR_ERR("%s no cmdq handle\n", __func__);
+		return;
+	}
 
-	/* The GPR-timer based poll (cmdq_pkt_poll_timeout) hangs the CFG
-	 * thread on WFE(GPR_TIMER_R7=1001) on this kernel - the TPR timer
-	 * never fires, the pkt sits at WAIT EVENT:1001 forever, and the
-	 * 1s cmdq timeout -> reset -> retry loop then takes the whole
-	 * display stack down (lock screen never wakes). poll_reg is a
-	 * plain read/compare/jump loop with no timer dependency; the
-	 * cmdq SW timeout still bounds it if the target never matches.
+	/* Keep this identical to the Xiaomi/A12/A13 original: the poll_reg
+	 * form stays disabled and the GPR-timer based poll_timeout is used.
+	 * poll_reg only works when it is handed comp->cmdq_subsys; passing
+	 * the invalid SUBSYS_NO_SUPPORT makes it poll a bogus subsystem, so
+	 * the DSI CMD_DONE bit is never seen and the GCE thread parks on
+	 * "[Poll ] poll SubSys Reg 0x0003000d = 0x00000020" until the CMDQ
+	 * SW timeout fires - which shows up as garbled output, random black
+	 * screens and a frozen UI.
 	 */
-#if 1
-	cmdq_pkt_poll_reg(handle, val, SUBSYS_NO_SUPPORT, reg & 0xFFFF,
-			  mask);
+#if 0
+	cmdq_pkt_poll_reg(handle, val, comp->cmdq_subsys, reg & 0xFFFF, mask);
 #else
-	{
-		struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
-		struct cmdq_client *client =
-			mtk_crtc->gce_obj.client[CLIENT_DSI_CFG];
-
-		if (handle->cl == (void *)client) {
-			cmdq_pkt_poll_timeout(handle, val, SUBSYS_NO_SUPPORT,
-					  reg, mask, 0xFFFF,
-					  CMDQ_GPR_R14);
-		} else {
-			cmdq_pkt_poll_timeout(handle, val, SUBSYS_NO_SUPPORT,
-					  reg, mask, 0xFFFF,
-					  CMDQ_GPR_R07);
-		}
+	if (handle->cl == (void *)client) {
+		cmdq_pkt_poll_timeout(handle, val, SUBSYS_NO_SUPPORT,
+				      reg, mask, 0xFFFF,
+				      CMDQ_GPR_R14);
+	} else {
+		cmdq_pkt_poll_timeout(handle, val, SUBSYS_NO_SUPPORT,
+				      reg, mask, 0xFFFF,
+				      CMDQ_GPR_R07);
 	}
 #endif
 }

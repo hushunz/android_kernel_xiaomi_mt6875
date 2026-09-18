@@ -115,6 +115,12 @@ static unsigned int g_pf_released[MAX_CRTC];
 static int g_pf_released_valid[MAX_CRTC];
 static unsigned long g_last_cmdq_cb_jiffies;
 
+/* A12/A13 keep the CMD-mode TE counter here; the frame-config callback
+ * resets it to 1 when a doze-active commit lands in frame-trigger mode.
+ * Global in the official kernel as well (kernel.elf @0xffffff80088600c8
+ * stores to a fixed address, not to a mtk_crtc field). */
+unsigned int te_cnt;
+
 static void mtk_drm_pf_watchdog(struct work_struct *ws)
 {
 	extern struct mtk_drm_private *g_mtk_private;
@@ -3277,6 +3283,7 @@ static void ddp_cmdq_cb(struct cmdq_cb_data data)
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	int session_id, id;
 	unsigned int ovl_status = 0;
+	struct mtk_crtc_state *mtk_state;
 
 	DDPINFO("crtc_state:%px, atomic_state:%px, crtc:%px\n",
 		crtc_state,
@@ -3312,10 +3319,30 @@ static void ddp_cmdq_cb(struct cmdq_cb_data data)
 	}
 	CRTC_MMP_MARK(id, frame_cfg, ovl_status, 0);
 
-	mtk_crtc_release_input_layer_fence(crtc, session_id);
-
+	/* A12 kernel.elf @0xffffff800885feac and A13 camellian release the
+	 * input layer fences exactly once, and only behind session_id > 0.
+	 * A11 carried an extra unconditional call in front of this one, so
+	 * every layer's fence was released twice off the same
+	 * DISP_SLOT_CUR_CONFIG_FENCE(i) index (mtk_crtc_release_input_layer_fence
+	 * is a straight loop over mtk_crtc->layer_nr, it does not consume the
+	 * slot).  hwcomposer then believed the buffer was free while OVL was
+	 * still reading it and recycled the mapping, which is the
+	 * mtk_iommu_isr TRANSLATION FAULT on larb0/port1
+	 * (M4U_PORT_L0_OVL_RDMA0_HDR) that shows up whenever buffer turnover
+	 * is high - screenshots, WeChat, camera preview. */
 	if (session_id > 0)
 		mtk_crtc_release_input_layer_fence(crtc, session_id);
+
+	/* A12 kernel.elf @0xffffff80088600ac: load crtc->state, bail when it
+	 * is NULL, then require frame-trigger mode plus DOZE_ACTIVE before
+	 * setting te_cnt = 1.  A13 camellian reads the same. */
+	if (crtc->state) {
+		mtk_state = to_mtk_crtc_state(crtc->state);
+		if (mtk_crtc_is_frame_trigger_mode(crtc) &&
+			mtk_state->prop_val[CRTC_PROP_DOZE_ACTIVE]) {
+			te_cnt = 1;
+		}
+	}
 
 	/* Present fence in VDO mode, released *after* the input layer fence
 	 * exactly as A13 camellian and A12 kernel.elf order it.  Signalling

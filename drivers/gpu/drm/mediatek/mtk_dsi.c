@@ -1872,6 +1872,9 @@ static void mtk_dsi_exit_ulps(struct mtk_dsi *dsi)
 
 static int mtk_dsi_stop_vdo_mode(struct mtk_dsi *dsi, void *handle);
 
+void mtk_dsi_set_mmclk_by_datarate(struct mtk_dsi *dsi,
+	struct mtk_drm_crtc *mtk_crtc, unsigned int en);
+
 static void mipi_dsi_dcs_write_gce2(struct mtk_dsi *dsi, struct cmdq_pkt *dummy,
 					  const void *data, size_t len);
 
@@ -2131,6 +2134,16 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 		mtk_dsi_set_mode(dsi->slave_dsi);
 		mtk_dsi_clk_hs_mode(dsi->slave_dsi, 1);
 	}
+	/* A12/A13 (mtk_output_dsi_enable, official kernel @0xffffff8008890de8)
+	 * recompute the display MMDVFS request from the panel data rate right
+	 * after the DSI is brought back to high speed.  Without it the DISP
+	 * MMCLK stays on whatever step the last pixel-clock lookup picked, and
+	 * because a VDO panel keeps streaming while MMDVFS hops, a too-low step
+	 * starves the DSI FIFO: "DDP_COMPONENT_DSI0: buffer underrun" fires
+	 * first and only ~10 ms later does the stall reach OVL as
+	 * "frame underflow" / "input relay unfinish".  Setting it here keeps
+	 * pixclk_min = data_rate * lanes / 8 / 3 as the floor. */
+	mtk_dsi_set_mmclk_by_datarate(dsi, to_mtk_crtc(crtc), 1);
 
 	/* A12 (mtk_output_dsi_enable @0x889a2f4): CMD panels are NOT
 	 * started here - the trig loop's per-frame config_trigger
@@ -5087,8 +5100,34 @@ static ssize_t mtk_dsi_host_send_cmd(struct mtk_dsi *dsi,
 static void mtk_dsi_dy_fps_cmdq_cb(struct cmdq_cb_data data)
 {
 	struct mtk_cmdq_cb_data *cb_data = data.data;
+	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(cb_data->crtc);
+	struct mtk_ddp_comp *comp = mtk_ddp_comp_request_output(mtk_crtc);
+	struct mtk_dsi *dsi;
+	int vrefresh = 0;
 
-	DDPINFO("%s vdo mode fps change done\n", __func__);
+	/* A12/A13 (mtk_dsi_dy_fps_cmdq_cb, official kernel @0xffffff8008892fb0)
+	 * refresh the DISP MMCLK bandwidth request once a dynamic-fps switch
+	 * has actually landed: the commit that changed vrefresh also changed
+	 * the pixel clock the panel needs, so the MMDVFS step chosen at
+	 * enable time is stale from this frame on.  Only do it when the
+	 * callback really carried the new vrefresh. */
+	if (IS_ERR_OR_NULL(mtk_crtc) || IS_ERR_OR_NULL(&mtk_crtc->base)) {
+		cmdq_pkt_destroy(cb_data->cmdq_handle);
+		kfree(cb_data);
+		return;
+	}
+
+	vrefresh = mtk_crtc->base.state->adjusted_mode.vrefresh;
+	DDPINFO("%s vdo mode fps change done, target fps %d, vrefresh %d\n",
+		__func__, cb_data->misc, vrefresh);
+
+	if (comp && (comp->id == DDP_COMPONENT_DSI0 ||
+		comp->id == DDP_COMPONENT_DSI1) &&
+		(cb_data->misc && (cb_data->misc == vrefresh))) {
+		dsi = container_of(comp, struct mtk_dsi, ddp_comp);
+		mtk_dsi_set_mmclk_by_datarate(dsi, mtk_crtc, 1);
+	}
+
 	cmdq_pkt_destroy(cb_data->cmdq_handle);
 	kfree(cb_data);
 }
@@ -5361,6 +5400,12 @@ static void mtk_dsi_vdo_timing_change(struct mtk_dsi *dsi,
 			to_mtk_crtc_state(old_state);
 	unsigned int src_mode =
 	    old_mtk_state->prop_val[CRTC_PROP_DISP_MODE_IDX];
+	/* A12/A13 record the source and destination refresh rate so the
+	 * completion callback can tell whether the dynamic-fps commit that
+	 * just landed really needs a DISP MMCLK refresh. */
+	struct drm_display_mode *old_mode = &(mtk_crtc->avail_modes[src_mode]);
+	unsigned int fps_src = old_mode->vrefresh;
+	unsigned int fps_dst = adjusted_mode.vrefresh;
 
 	DDPINFO("%s+\n", __func__);
 
@@ -5457,6 +5502,8 @@ static void mtk_dsi_vdo_timing_change(struct mtk_dsi *dsi,
 		mtk_dsi_porch_setting(comp, handle, DSI_VFP, vfp);
 	}
 	cb_data->cmdq_handle = handle;
+	cb_data->crtc = &mtk_crtc->base;
+	cb_data->misc = fps_dst > fps_src ? 0 : fps_dst; /* only for lower fps */
 	if (cmdq_pkt_flush_threaded(handle,
 		mtk_dsi_dy_fps_cmdq_cb, cb_data) < 0)
 		DDPPR_ERR("failed to flush dsi_dy_fps\n");

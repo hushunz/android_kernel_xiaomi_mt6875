@@ -648,7 +648,27 @@ static int __init emimpu_ap_region_init(void)
 	if (!(emimpu_dev_ptr->ap_rg_info))
 		return 0;
 
-	mtk_emimpu_set_protection(emimpu_dev_ptr->ap_rg_info);
+	/* The AP region protection is deliberately not armed here.
+	 *
+	 * Every DTS in this tree (mt6853/mt6873/mt6885) omits dram_start
+	 * and dram_end, and emimpu_probe() bails out with -EINVAL when
+	 * dram_start is missing, so on A11 firmware this driver never
+	 * registered and the protection never took effect.  The A12 DTB
+	 * does carry dram_start/dram_end, so probe now succeeds and this
+	 * late_initcall would program region 31 with the A12 ap_apc, whose
+	 * domain 4 entry is SEC_RW_NSEC_R where every A11 platform has
+	 * NO_PROTECTION.  This kernel has no matching access changes for
+	 * that, so OVL and the GPU end up rejected:
+	 *
+	 *   emimpu_violation_irq: emi0, offset(0x1f0), ...   (148442 times)
+	 *   DDP_COMPONENT_OVL0: L1/L2/L3 not complete until EOF!
+	 *   DDP_COMPONENT_OVL0: frame underflow!
+	 *
+	 * which is the garbled picture, the random black screens and the
+	 * stutter, and SystemUI dying with VK_ERROR_DEVICE_LOST.  Keep the
+	 * A11 behaviour: the settings are still parsed and freed, the MPU
+	 * is simply not programmed.
+	 */
 	mtk_emimpu_free_region(emimpu_dev_ptr->ap_rg_info);
 
 	kfree(emimpu_dev_ptr->ap_rg_info);

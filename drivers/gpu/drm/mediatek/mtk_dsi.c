@@ -310,6 +310,11 @@ enum dsi_porch_type { DECLARE_DSI_PORCH(DECLARE_NUM) };
 static const char * const mtk_dsi_porch_str[] = {
 	DECLARE_DSI_PORCH(DECLARE_STR)};
 
+/* A12/A13 serialise the DISP MMCLK recomputation: it is reachable from
+ * the enable path, from the dynamic-fps completion callback and from the
+ * SET_MMCLK_BY_DATARATE ioctl, all of which can run concurrently. */
+static DEFINE_MUTEX(set_mmclk_lock);
+
 #define AS_UINT32(x) (*(u32 *)((void *)x))
 
 struct mtk_dsi_driver_data {
@@ -5578,27 +5583,53 @@ void mtk_dsi_set_mmclk_by_datarate(struct mtk_dsi *dsi,
 {
 	struct mtk_panel_ext *ext = dsi->ext;
 	unsigned int compress_rate;
+	unsigned int bubble_rate = 105;
 	unsigned int data_rate;
 	unsigned int pixclk = 0;
 	u32 bpp = mipi_dsi_pixel_format_to_bpp(dsi->format);
 	unsigned int pixclk_min = 0;
-	unsigned int hact = mtk_crtc->base.state->adjusted_mode.hdisplay;
-	unsigned int htotal = mtk_crtc->base.state->adjusted_mode.htotal;
-	unsigned int vtotal = mtk_crtc->base.state->adjusted_mode.vtotal;
-	unsigned int vact = mtk_crtc->base.state->adjusted_mode.vdisplay;
-	unsigned int vrefresh = mtk_crtc->base.state->adjusted_mode.vrefresh;
+	unsigned int hact = 0;
+	unsigned int htotal = 0;
+	unsigned int vtotal = 0;
+	unsigned int vact = 0;
+	unsigned int vrefresh = 0;
 
+	/* A12/A13 shape, confirmed against kernel.elf @0xffffff800888661c:
+	 * mutex_lock() at +0x58 and +0x8c, `mov w9, #0x69` (bubble_rate =
+	 * 105) at +0x2c0 feeding a mul/div by 100, and the final
+	 * `cmp w22, w8; csel w8, w22, w8, hi` that keeps pixclk_min as the
+	 * floor.  a11 had neither the lock nor the 5% bubble nor the
+	 * vrefresh check, so a VDO panel could be handed a pixel clock
+	 * below what the DSI link needs - the DSI FIFO then starves
+	 * ("buffer underrun") before the stall shows up in OVL. */
+	mutex_lock(&set_mmclk_lock);
+	hact = mtk_crtc->base.state->adjusted_mode.hdisplay;
+	htotal = mtk_crtc->base.state->adjusted_mode.htotal;
+	vtotal = mtk_crtc->base.state->adjusted_mode.vtotal;
+	vact = mtk_crtc->base.state->adjusted_mode.vdisplay;
+	vrefresh = mtk_crtc->base.state->adjusted_mode.vrefresh;
 	if (!en) {
 		mtk_drm_set_mmclk_by_pixclk(&mtk_crtc->base, pixclk,
 					__func__);
+		mutex_unlock(&set_mmclk_lock);
 		return;
 	}
+	if (!vrefresh) {
+		DDPMSG("%s: skip set mmclk, vrefresh=%d\n", __func__, vrefresh);
+		mutex_unlock(&set_mmclk_lock);
+		return;
+	}
+
 	//for FPS change,update dsi->ext
 	dsi->ext = find_panel_ext(dsi->panel);
 	data_rate = mtk_dsi_default_rate(dsi);
+#ifdef CONFIG_MTK_MT6382_BDG
+	data_rate = data_rate * RXTX_RATIO / 100;
+#endif
 
 	if (!dsi->ext) {
 		DDPPR_ERR("DSI panel ext is NULL\n");
+		mutex_unlock(&set_mmclk_lock);
 		return;
 	}
 
@@ -5606,6 +5637,7 @@ void mtk_dsi_set_mmclk_by_datarate(struct mtk_dsi *dsi,
 
 	if (!data_rate) {
 		DDPPR_ERR("DSI data_rate is NULL\n");
+		mutex_unlock(&set_mmclk_lock);
 		return;
 	}
 	//If DSI mode is vdo mode
@@ -5622,6 +5654,7 @@ void mtk_dsi_set_mmclk_by_datarate(struct mtk_dsi *dsi,
 		else
 			pixclk = pixclk * (vtotal * htotal * 100 /
 				(vact * hact)) / 100;
+		pixclk = pixclk * bubble_rate / 100;
 		pixclk = (unsigned int)(pixclk / 1000);
 		pixclk = (pixclk_min > pixclk) ? pixclk_min : pixclk;
 	}
@@ -5636,9 +5669,11 @@ void mtk_dsi_set_mmclk_by_datarate(struct mtk_dsi *dsi,
 	if (mtk_crtc->is_dual_pipe)
 		pixclk /= 2;
 
-	DDPINFO("%s,data_rate =%d,clk=%u pixclk_min=%d\n", __func__,
-			data_rate, pixclk, pixclk_min);
+	DDPINFO("%s,data_rate=%d,clk=%u pixclk_min=%d, dual=%u, vrefresh=%d\n",
+		__func__, data_rate, pixclk, pixclk_min,
+		mtk_crtc->is_dual_pipe, vrefresh);
 	mtk_drm_set_mmclk_by_pixclk(&mtk_crtc->base, pixclk, __func__);
+	mutex_unlock(&set_mmclk_lock);
 }
 
 /******************************************************************************

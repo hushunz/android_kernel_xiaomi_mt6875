@@ -4144,11 +4144,25 @@ static int mtk_iommu_hw_init(struct mtk_iommu_data *data)
 		return 0;
 	}
 #endif
+	/* kernel.elf mtk_iommu_probe @0xffffff80087b2d90 sets exactly one bit
+	 * here:
+	 *     add  x8, x8, #0x110        REG_MMU_CTRL_REG
+	 *     ldr  w8, [x8]
+	 *     orr  w8, w8, #0x2          F_MMU_CTRL_MONITOR_EN (bit1)
+	 *     str  w8, [x9]
+	 * Nothing else in the register is touched.  A11 additionally forced
+	 * bit0 to 0 via F_MMU_CTRL_PFH_DIS(0), and bit0 is PFH_DIS - writing
+	 * 0 there *enables* the MMU prefetch engine instead of leaving the
+	 * hardware default alone.  Prefetch walks ahead of the live access,
+	 * so when OVL swaps buffers the prefetcher steps past the end of the
+	 * still-mapped range and raises a TRANSLATION FAULT for an iova that
+	 * mtk_iommu_iova_to_phys() resolves perfectly well (the signature in
+	 * the log: get pa valid, ptbase reads 0, port=L0_OVL_RDMA0_HDR, and
+	 * it only fires while buffer turnover is high - screenshots, WeChat,
+	 * camera).  MONITOR_CLR and INT_FREEZE_EN are likewise left at their
+	 * hardware values, as the official kernel does. */
 	regval = readl_relaxed(data->base + REG_MMU_CTRL_REG);
-	regval = regval | F_MMU_CTRL_PFH_DIS(0)
-			 | F_MMU_CTRL_MONITOR_EN(1)
-			 | F_MMU_CTRL_MONITOR_CLR(0)
-			 | F_MMU_CTRL_INT_FREEZE_EN(0);
+	regval = regval | F_MMU_CTRL_MONITOR_EN(1);
 
 	writel_relaxed(regval, data->base + REG_MMU_CTRL_REG);
 

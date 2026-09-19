@@ -441,25 +441,25 @@ int vcu_ipi_send(struct platform_device *pdev,
 
 	if (vcu_ptr->abort || ret == 0) {
 		dev_info(&pdev->dev, "vcu ipi %d ack time out !%d", id, ret);
-		if (!vcu_ptr->abort) {
-			task_lock(vcud_task);
+		/*
+		 * Keep this identical to the official kernel: two send_sig()
+		 * calls back to back, no task_lock()/task_unlock().
+		 *
+		 * This tree used to wrap the SIGTERM in task_lock()/task_unlock().
+		 * That is a crash waiting to happen: this tree's
+		 * probe_death_signal() clears vcud_task as soon as the SIGKILL
+		 * below is delivered to vpud, so the task_unlock() that followed
+		 * dereferenced NULL (task_struct->alloc_lock sits at offset 0x850)
+		 * and panicked in _raw_spin_unlock <- vcu_ipi_send.  The official
+		 * kernel leaves vcud_task alone in probe_death_signal(), which is
+		 * the only reason the same locking would be harmless there.
+		 *
+		 * vcud_task == NULL just means no vpud has /dev/vcu open, so there
+		 * is nothing to signal.
+		 */
+		if (!vcu_ptr->abort && vcud_task) {
 			send_sig(SIGTERM, vcud_task, 0);
-			/*
-			 * MTK sends SIGKILL right after SIGTERM: vpud does not always
-			 * act on SIGTERM, and without SIGKILL the caller then sits in
-			 * down_interruptible(&vcu_ptr->vpud_killed) for ~45s.
-			 *
-			 * That wait happens on the calling task.  Here it is
-			 * system_server's StorageManagerService handler thread, which
-			 * blocks inside handleSystemReady() ->
-			 * configureTranscoding() -> isHevcDecoderSupported() ->
-			 * MediaCodecList and therefore never gets to run the queued
-			 * H_BOOT_COMPLETED message.  Result: resetIfBootedAndConnected()
-			 * never runs, the emulated volumes are never handed to vold and
-			 * /storage/emulated stays unmounted (screenshots fail).
-			 */
 			send_sig(SIGKILL, vcud_task, 0);
-			task_unlock(vcud_task);
 		}
 		if (vcu_ptr->open_cnt > 0) {
 			dev_info(vcu->dev, "wait for vpud killed %d\n",

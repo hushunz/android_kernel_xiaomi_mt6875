@@ -454,6 +454,13 @@ CONFIG_MSDOS_FS=y
 CONFIG_VFAT_FS=y
 CONFIG_TMPFS=y
 CONFIG_SDCARD_FS=y
+# Android 15 mounts /storage/emulated through FUSE via vold.  The base
+# defconfig has CONFIG_FUSE_FS=m, but this tree ships a kernel image without
+# modules, so vold found no FUSE support, never created the emulated volume,
+# and every screenshot failed with "Volume external_primary not found"
+# (written to /dev/null/DCIM/Screenshots).  The official A12 kernel for this
+# device has FUSE built in (/proc/filesystems lists fuse).
+CONFIG_FUSE_FS=y
 CONFIG_PSTORE=y
 CONFIG_PSTORE_CONSOLE=y
 CONFIG_PSTORE_PMSG=y

@@ -840,7 +840,12 @@ static void devapc_extra_handler(int slave_type, const char *vio_master,
 
 	/* Severity level */
 	if (dbg_stat->enable_KE && (ret_cb != DEVAPC_NOT_KE)) {
-		pr_info(PFX "Device APC Violation Issue/%s", dispatch_key);
+		/* MTKDBG: pr_err, not pr_info.  The very next statement is
+		 * BUG_ON(id != INFRA_SUBSYS_CONN), so this line is the last
+		 * thing printed before the kernel dies; at pr_info level it
+		 * never reached the console (pstore console-ramoops) and the
+		 * panic could not be attributed to a subsystem. */
+		pr_err(PFX "Device APC Violation Issue/%s", dispatch_key);
 		BUG_ON(id != INFRA_SUBSYS_CONN);
 
 	} else if (dbg_stat->enable_AEE) {
@@ -922,7 +927,7 @@ static irqreturn_t devapc_violation_irq(int irq_number, void *dev_id)
 			vio_master = "UNKNOWN_MASTER";
 		}
 
-		pr_info(PFX "%s - %s:0x%x, %s:0x%x, %s:0x%x, %s:0x%x\n",
+		pr_err(PFX "%s - %s:0x%x, %s:0x%x, %s:0x%x, %s:0x%x\n",
 				"Violation", "slave_type", slave_type,
 				"sys_index",
 				device_info[slave_type][index].sys_index,
@@ -931,7 +936,10 @@ static irqreturn_t devapc_violation_irq(int irq_number, void *dev_id)
 				"vio_index",
 				device_info[slave_type][index].vio_index);
 
-		pr_info(PFX "%s %s %s %s\n",
+		/* MTKDBG: pr_err so the offending master and slave *device name*
+		 * survive into pstore; this is the line that identifies which
+		 * peripheral the AP illegally read. */
+		pr_err(PFX "%s %s %s %s\n",
 				"Violation - master:", vio_master,
 				"access violation slave:",
 				device_info[slave_type][index].device);

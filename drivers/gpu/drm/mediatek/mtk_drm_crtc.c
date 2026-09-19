@@ -2099,6 +2099,39 @@ static unsigned int overlap_to_bw(struct drm_crtc *crtc,
 	return bw;
 }
 
+/* HRT (the bandwidth vote DVFSRC turns into the DRAM frequency) was derived
+ * from the panel geometry alone: overlap_to_bw() scales one panel-sized frame
+ * by the layer overlap SurfaceFlinger reports.  That describes a plain UI
+ * frame well, but it misses what the OVL actually reads when the frame is
+ * made of full-screen AFBC layers - a screenshot, WeChat, the gallery.  There
+ * the OVL's own per-layer accounting reports ~2 GB/s (fbdc_bw 725 + 1256 in
+ * the bring-up log) while the panel-derived vote stays at one frame, i.e.
+ * ~780 MB/s, so DVFSRC keeps the DRAM at the lowest point and the OVL cannot
+ * finish its reads before EOF ("L0..L3 not complete until EOF", "RDMA0:
+ * abnormal", frame underflow, then the DSI starvation storm).
+ *
+ * Take the larger of the two votes: the panel-derived one still covers the
+ * cases where no OVL component has run yet, and the measured one follows the
+ * frame the display is really scanning out.  qos_bw/fbdc_bw are accumulated
+ * per layer in mtk_ovl_layer_config() and are therefore the current frame's
+ * numbers by the time the flush path computes the HRT vote.
+ */
+#define OVL_HRT_BW_OVERHEAD_PCT 110
+
+static unsigned int mtk_crtc_ovl_frame_bw(struct mtk_drm_crtc *mtk_crtc)
+{
+	struct mtk_ddp_comp *comp;
+	unsigned int total = 0;
+	int i, j;
+
+	for (i = 0; i < DDP_PATH_NR; i++) {
+		for_each_comp_in_crtc_target_path(comp, mtk_crtc, j, i)
+			total += comp->qos_bw + comp->fbdc_bw;
+	}
+
+	return total * OVL_HRT_BW_OVERHEAD_PCT / 100;
+}
+
 static void mtk_crtc_update_hrt_state(struct drm_crtc *crtc,
 				      unsigned int frame_weight,
 				      struct cmdq_pkt *cmdq_handle)
@@ -2108,9 +2141,13 @@ static void mtk_crtc_update_hrt_state(struct drm_crtc *crtc,
 	struct mtk_crtc_state *crtc_state = to_mtk_crtc_state(crtc->state);
 	struct cmdq_pkt_buffer *cmdq_buf = &(mtk_crtc->gce_obj.buf);
 	unsigned int bw = overlap_to_bw(crtc, frame_weight);
+	unsigned int ovl_bw = mtk_crtc_ovl_frame_bw(mtk_crtc);
 
-	DDPINFO("%s bw=%d, last_hrt_req=%d\n",
-		__func__, bw, mtk_crtc->qos_ctx->last_hrt_req);
+	if (ovl_bw > bw)
+		bw = ovl_bw;
+
+	DDPINFO("%s bw=%d, ovl_bw=%d, last_hrt_req=%d\n",
+		__func__, bw, ovl_bw, mtk_crtc->qos_ctx->last_hrt_req);
 
 	/* Only update HRT information on path with HRT comp */
 	if (bw > mtk_crtc->qos_ctx->cur_hrt_req) {

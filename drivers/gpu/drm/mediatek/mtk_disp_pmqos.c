@@ -26,6 +26,12 @@ static u64 g_freq_steps[MAX_FREQ_STEP];
 static int g_freq_level = -1;
 static int step_size = 1;
 
+/* MTKDBG: the HRT vote is the number DVFSRC turns into the DRAM frequency, and
+ * nothing in the logs showed it.  Print it (rate limited, it is a per-frame
+ * path) together with what the display path asked for, so a single boot shows
+ * whether the vote tracks the frame the OVL is actually reading. */
+static DEFINE_RATELIMIT_STATE(hrt_bw_ratelimit, HZ, 5);
+
 #ifdef MTK_FB_MMDVFS_SUPPORT
 int __mtk_disp_pmqos_slot_look_up(int comp_id, int mode)
 {
@@ -199,12 +205,30 @@ int mtk_disp_set_hrt_bw(struct mtk_drm_crtc *mtk_crtc, unsigned int bw)
 		}
 	}
 
-	if (ret == RDMA_REQ_HRT)
-		tmp = mtk_drm_primary_frame_bw(crtc);
+	/* RDMA in memory mode (the VDO path) replaces the vote with one panel
+	 * frame's worth of data rate.  That is the floor the display must have
+	 * to keep scanning out at all, but a frame built from full-screen AFBC
+	 * layers needs more than one panel frame's worth of DRAM bandwidth -
+	 * the OVL's per-layer accounting reports it (qos_bw/fbdc_bw).  Keep the
+	 * larger of the two: HRT only sets the DRAM frequency floor, so asking
+	 * for the frame's real requirement can prevent an underflow but cannot
+	 * starve anything else. */
+	if (ret == RDMA_REQ_HRT) {
+		unsigned int frame_bw = mtk_drm_primary_frame_bw(crtc);
+
+		if (frame_bw > tmp)
+			tmp = frame_bw;
+	}
 
 	mm_qos_set_hrt_request(&priv->hrt_bw_request, tmp);
 	DRM_MMP_MARK(hrt_bw, 0, tmp);
 	DDPINFO("set HRT bw %u\n", tmp);
+
+	if (__ratelimit(&hrt_bw_ratelimit))
+		pr_err("MTKDBG HRT req=%u (req_by_path=%u rdma_override=%d disp_mmclk=%llu)\n",
+		       tmp, bw, ret == RDMA_REQ_HRT,
+		       mmdvfs_qos_get_freq(PM_QOS_DISP_FREQ));
+
 	mm_qos_update_all_request(&priv->hrt_request_list);
 	mtk_crtc->qos_ctx->cur_hrt_req = bw;
 

@@ -938,11 +938,19 @@ static irqreturn_t devapc_violation_irq(int irq_number, void *dev_id)
 
 		/* MTKDBG: pr_err so the offending master and slave *device name*
 		 * survive into pstore; this is the line that identifies which
-		 * peripheral the AP illegally read. */
-		pr_err(PFX "%s %s %s %s\n",
+		 * peripheral the AP illegally read.  vio_addr is the decisive
+		 * field: it pins the violation to one exact register (the last
+		 * capture said "master: APMCU_read access violation slave:
+		 * VDECSYS, slave_type 0x0 sys_index 0x1 ctrl_index 0x57
+		 * vio_index 0x6d", which is the VDECSYS row in
+		 * devapc-mt6873.c, but not which register). */
+		pr_err(PFX "%s %s %s %s %s 0x%x %s 0x%x %s 0x%x\n",
 				"Violation - master:", vio_master,
 				"access violation slave:",
-				device_info[slave_type][index].device);
+				device_info[slave_type][index].device,
+				"vio_addr:", vio_info->vio_addr,
+				"master_id:", vio_info->master_id,
+				"domain_id:", vio_info->domain_id);
 
 		devapc_vio_reason(perm);
 

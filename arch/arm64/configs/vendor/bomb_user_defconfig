@@ -461,6 +461,14 @@ CONFIG_SDCARD_FS=y
 # (written to /dev/null/DCIM/Screenshots).  The official A12 kernel for this
 # device has FUSE built in (/proc/filesystems lists fuse).
 CONFIG_FUSE_FS=y
+# MIUI's ExtM (memory extension) service blocks the whole StorageManagerService
+# handler thread on its first "read kernel info" step when /proc/mv is missing,
+# which stops vold from ever being told about the emulated volumes.  The
+# official A12 kernel has this driver built in; this tree did not.
+CONFIG_MI_MEMORY_SYSFS=y
+# ExtM also drives zram writeback ("zram userate is low, no need to flush").
+# The code is already in this tree, the official kernel just had it enabled.
+CONFIG_ZRAM_WRITEBACK=y
 CONFIG_PSTORE=y
 CONFIG_PSTORE_CONSOLE=y
 CONFIG_PSTORE_PMSG=y

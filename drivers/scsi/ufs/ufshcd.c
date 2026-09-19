@@ -3660,12 +3660,12 @@ EXPORT_SYMBOL(ufshcd_map_desc_id_to_length);
  *
  * Return 0 in case of success, non-zero otherwise
  */
-static int ufshcd_read_desc_param(struct ufs_hba *hba,
-				  enum desc_idn desc_id,
-				  int desc_index,
-				  u8 param_offset,
-				  u8 *param_read_buf,
-				  u8 param_size)
+int ufshcd_read_desc_param(struct ufs_hba *hba,
+			  enum desc_idn desc_id,
+			  int desc_index,
+			  u8 param_offset,
+			  u8 *param_read_buf,
+			  u8 param_size)
 {
 	int ret;
 	u8 *desc_buf;
@@ -3768,8 +3768,8 @@ EXPORT_SYMBOL(ufshcd_read_health_desc);
  * Return 0 in case of success, non-zero otherwise
  */
 #define ASCII_STD true
-static int ufshcd_read_string_desc(struct ufs_hba *hba, int desc_index,
-				   u8 *buf, u32 size, bool ascii)
+int ufshcd_read_string_desc(struct ufs_hba *hba, int desc_index,
+			   u8 *buf, u32 size, bool ascii)
 {
 	int err = 0;
 
@@ -9746,6 +9746,8 @@ out_error:
 }
 EXPORT_SYMBOL(ufshcd_alloc_host);
 
+extern void get_ufs_hba_data(struct ufs_hba *mi_hba);
+
 /**
  * ufshcd_init - Driver initialization routine
  * @hba: per-adapter instance
@@ -9969,6 +9971,13 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 	 * Initialize rpmb mutex.
 	 */
 	mutex_init(&hba->rpmb_lock);
+
+	/*
+	 * MIUI: hand the hba over to mi_memory so that /proc/mv and
+	 * /sys/class/mi_memory/* can report DDR/UFS info, exactly like
+	 * the official kernel does.
+	 */
+	get_ufs_hba_data(hba);
 
 	return 0;
 

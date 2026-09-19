@@ -1270,8 +1270,13 @@ void vcu_get_task(struct task_struct **task, struct files_struct **f,
 		files = NULL;
 	}
 
-	*task = vcud_task;
-	*f = files;
+	/* The official kernel accepts NULL here, and the vpud shutdown path
+	 * relies on that (it only wants the reset side effect).
+	 */
+	if (task)
+		*task = vcud_task;
+	if (f)
+		*f = files;
 }
 EXPORT_SYMBOL_GPL(vcu_get_task);
 
@@ -1357,7 +1362,7 @@ static int vcu_init_ipi_handler(void *data, unsigned int len, void *priv)
 			usleep_range(10000, 20000);
 		}
 
-		for (i = 0; i < 2; i++) {
+		for (i = 0; i < VCU_CODEC_MAX; i++) {
 			atomic_set(&vcu->ipi_got[i], 1);
 			atomic_set(&vcu->ipi_done[i], 0);
 			memset(&vcu->user_obj[i], 0,
@@ -1368,8 +1373,12 @@ static int vcu_init_ipi_handler(void *data, unsigned int len, void *priv)
 
 		atomic_set(&vcu->vdec_log_got, 1);
 		wake_up(&vcu->vdec_log_get_wq);
-		vcud_task = NULL;
-		files = NULL;
+		/* Same as the official kernel: clear vcud_task/files under the
+		 * file lock so a concurrent open() cannot see a half-cleared pair.
+		 */
+		vcu_get_file_lock();
+		vcu_get_task(NULL, NULL, 1);
+		vcu_put_file_lock();
 
 		dev_info(vcu->dev, "[VCU] vpud killing\n");
 
@@ -1398,8 +1407,19 @@ static int mtk_vcu_open(struct inode *inode, struct file *file)
 	else if (strcmp(current->comm, "mdpd") == 0)
 		vcuid = 1;
 	else if (strcmp(current->comm, "vpud") == 0) {
-		vcud_task = current;
+		/* Same as the official kernel: serialise vcud_task/files, and
+		 * refuse a second, unrelated vpud while one is still recorded.
+		 */
+		vcu_get_file_lock();
+		if (vcud_task &&
+			(current->tgid != vcud_task->tgid ||
+			current->group_leader != vcud_task->group_leader)) {
+			vcu_put_file_lock();
+			return -EACCES;
+		}
+		vcud_task = current->group_leader;
 		files = vcud_task->files;
+		vcu_put_file_lock();
 		vcuid = 0;
 	} else if (strcmp(current->comm, "vdec_srv") == 0 ||
 		strcmp(current->comm, "venc_srv") == 0) {
@@ -1424,8 +1444,9 @@ static int mtk_vcu_open(struct inode *inode, struct file *file)
 	vcu_ptr->abort = false;
 	vcu_ptr->vpud_is_going_down = 0;
 
-	pr_info("[VCU] %s name: %s pid %d open_cnt %d\n", __func__,
-		current->comm, current->tgid, vcu_ptr->open_cnt);
+	pr_info("[VCU] %s name: %s pid %d tgid %d open_cnt %d current %p group_leader %p\n",
+		__func__, current->comm, current->pid, current->tgid,
+		vcu_ptr->open_cnt, current, current->group_leader);
 
 	return 0;
 }

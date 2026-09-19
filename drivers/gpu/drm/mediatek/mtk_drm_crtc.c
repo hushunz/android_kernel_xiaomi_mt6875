@@ -2143,9 +2143,13 @@ static void mtk_crtc_update_hrt_state(struct drm_crtc *crtc,
 	unsigned int bw = overlap_to_bw(crtc, frame_weight);
 	unsigned int ovl_bw = mtk_crtc_ovl_frame_bw(mtk_crtc);
 
-	if (ovl_bw > bw)
-		bw = ovl_bw;
-
+	/* MTKDBG: ovl_bw is reported only.  The official kernel votes
+	 * overlap_to_bw() alone, and folding the OVL number into bw is not
+	 * neutral: bw is also stored in qos_ctx->cur_hrt_req, which gates the
+	 * vote update below (mtk_disp_set_hrt_bw() runs only while bw keeps
+	 * growing), and it is what gets written into DISP_SLOT_CUR_HRT_LEVEL
+	 * for the hardware.  Raising it therefore changes both when the vote
+	 * is refreshed and the level the hardware sees. */
 	DDPINFO("%s bw=%d, ovl_bw=%d, last_hrt_req=%d\n",
 		__func__, bw, ovl_bw, mtk_crtc->qos_ctx->last_hrt_req);
 

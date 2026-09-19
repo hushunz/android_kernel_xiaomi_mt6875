@@ -205,20 +205,12 @@ int mtk_disp_set_hrt_bw(struct mtk_drm_crtc *mtk_crtc, unsigned int bw)
 		}
 	}
 
-	/* RDMA in memory mode (the VDO path) replaces the vote with one panel
-	 * frame's worth of data rate.  That is the floor the display must have
-	 * to keep scanning out at all, but a frame built from full-screen AFBC
-	 * layers needs more than one panel frame's worth of DRAM bandwidth -
-	 * the OVL's per-layer accounting reports it (qos_bw/fbdc_bw).  Keep the
-	 * larger of the two: HRT only sets the DRAM frequency floor, so asking
-	 * for the frame's real requirement can prevent an underflow but cannot
-	 * starve anything else. */
-	if (ret == RDMA_REQ_HRT) {
-		unsigned int frame_bw = mtk_drm_primary_frame_bw(crtc);
-
-		if (frame_bw > tmp)
-			tmp = frame_bw;
-	}
+	/* MTKDBG: back to the official behaviour -- RDMA in memory mode (the VDO
+	 * path) replaces the vote with one panel frame's data rate, and the
+	 * official kernel does not fold the OVL's per-layer accounting into it.
+	 * The diagnostic line below still reports both. */
+	if (ret == RDMA_REQ_HRT)
+		tmp = mtk_drm_primary_frame_bw(crtc);
 
 	mm_qos_set_hrt_request(&priv->hrt_bw_request, tmp);
 	DRM_MMP_MARK(hrt_bw, 0, tmp);

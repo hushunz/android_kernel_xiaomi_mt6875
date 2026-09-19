@@ -638,19 +638,30 @@ static irqreturn_t mtk_disp_ovl_irq_handler(int irq, void *dev_id)
 		 * between the A12 buffer layout and the A11 FBDC config is
 		 * the prime suspect for the per-frame 2L underflow while
 		 * scrolling. */
-		if (ovl->id == DDP_COMPONENT_OVL0_2L) {
+		/* MTKDBG: report the per-frame bandwidth this driver computed
+		 * (qos_bw/fbdc_bw, the numbers it hands to SMI) next to the
+		 * DISP frequency MMDVFS is actually running at, for every OVL
+		 * instance - OVL0 reports L2/L3 as incomplete, OVL0_2L reports
+		 * L0/L1.  If qos_bw is large while DISP_MMCLK still sits on the
+		 * lowest step, MMDVFS never sees the request and that is the
+		 * starvation to fix; if qos_bw is 0 the bandwidth accounting
+		 * itself is not running for these frames. */
+		{
 			static unsigned int uf_dump_cnt;
-			unsigned int i;
+			unsigned int i, lnr = mtk_ovl_layer_num(ovl);
 
 			if (++uf_dump_cnt % 32 == 1) {
-				DDPPR_ERR("MTKDBG OVL2L underflow: DISP_MMCLK=%llu Hz\n",
-					  mmdvfs_qos_get_freq(PM_QOS_DISP_FREQ));
-				DDPPR_ERR("MTKDBG OVL2L DP_CON=0x%x\n",
+				DDPPR_ERR("MTKDBG %s underflow: DISP_MMCLK=%llu qos_bw=%u fbdc_bw=%u lnr=%u\n",
+					  mtk_dump_comp_str(ovl),
+					  mmdvfs_qos_get_freq(PM_QOS_DISP_FREQ),
+					  ovl->qos_bw, ovl->fbdc_bw, lnr);
+				DDPPR_ERR("MTKDBG %s DP_CON=0x%x\n",
+					  mtk_dump_comp_str(ovl),
 					  readl_relaxed(ovl->regs +
 						DISP_REG_OVL_DATAPATH_CON));
-				for (i = 0; i < 2; i++) {
-					DDPPR_ERR("MTKDBG OVL2L L%d CON=0x%x ADDR=0x%x SRC=0x%x PITCH=0x%x HDR_ADDR=0x%x\n",
-						  i,
+				for (i = 0; i < lnr && i < MAX_LAYER_NUM; i++) {
+					DDPPR_ERR("MTKDBG %s L%d CON=0x%x ADDR=0x%x SRC=0x%x PITCH=0x%x HDR_ADDR=0x%x\n",
+						  mtk_dump_comp_str(ovl), i,
 						  readl_relaxed(ovl->regs +
 							DISP_REG_OVL_CON(i)),
 						  readl_relaxed(ovl->regs +

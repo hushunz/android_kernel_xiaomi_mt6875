@@ -259,19 +259,22 @@ static inline struct mtk_disp_rdma *comp_to_rdma(struct mtk_ddp_comp *comp)
 	return container_of(comp, struct mtk_disp_rdma, ddp_comp);
 }
 
-/* 推一次 hwcomposer 用的 present fence。
+/* 推一次 hwcomposer 用的 present fence（pf_event / OVL-PF 那一条）。
  *
- * 三方一致的做法（官核 kernel.elf mtk_disp_rdma_irq_handler
- * @0xffffff8008839988、A13 camellian、A12 MT6873）：只在 RDMA 的
- * frame_start(bit1) 中断、且仅 CMD 模式、且非 DOZE_ACTIVE 时释放
- * present fence，frame_done(bit2) 里不碰它。
+ * 官核 kernel.elf mtk_disp_rdma_irq_handler @0xffffff8008839988 的做法是：
+ * 只在 RDMA 的 frame_start(bit1) 中断、且仅 CMD 模式
+ * (mtk_crtc_is_frame_trigger_mode)、且非 DOZE_ACTIVE 时推 pf_event 并
+ * wake_up(present_fence_wq)；frame_done(bit2) 里不碰它。A13 camellian 与
+ * A12 MT6873 相同。本函数与它逐行对应。
  *
- * 这里只推 pf_event：sf_pf_event 是 SurfaceFlinger 那一条，A13 把它放在
- * target_line(bit5) 并限定非 CMD(VDO) 模式，官核的 bit5 则完全不处理。
- * 在 frame_start 里连 sf 一起推会打乱 SF 的 BLAST 同步，实测为画面卡死：
- *   SurfaceFlinger: "waitForever: waiting for HWC release 3" 3000 ms
- *   BLASTSyncEngine: WM sent Transaction ... but never received commit callback
- * 而完全不推则表现为黑屏：
+ * SurfaceFlinger 那一条（sf_pf_event）是另一回事：A13 把它放在
+ * target_line(bit5) 并限定非 CMD(VDO) 模式，而官核的 bit5 分支只打日志、
+ * 且官核整片 DRM 区域内 sf_pf_event 从未被置 1（详见 bit5 分支处的注释）。
+ * 本树原来照 A13 在 bit5 推 sf_pf_event，已按官核去掉 —— 在帧中间就告诉 SF
+ * "已上屏"会让它立刻提交下一帧，显示配置被微秒级重写，OVL/RDMA 每帧都
+ * 读不完。
+ *
+ * 两者别混：本函数（pf_event）不推才会黑屏
  *   hwcomposer: "[OVL-PF] (0) fence N didn't signal in 200 ms"
  *   -> bootanimation QUEUE_BUFFER_TIMEOUT -> AAL screen 3(On) -> 0(Off)
  */
@@ -395,16 +398,29 @@ static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
 	if (val & (1 << 5)) {
 		DDPIRQ("[IRQ] %s: target line!\n", mtk_dump_comp_str(rdma));
 
-		/* 照 A13 camellian：SurfaceFlinger 那条 present fence 在
-		 * target_line 释放，且只在非 CMD(VDO) 模式下 —— CMD 模式由别的
-		 * 路径处理，在这里推会打乱 SF 的 BLAST 同步。官核的 bit5 完全
-		 * 不处理，加这段是为了跟 A13 对齐（对 CMD 设备不生效）。 */
-		if (mtk_crtc &&
-		    !mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
-			atomic_set(&mtk_crtc->sf_pf_event, 1);
-			wake_up_interruptible(
-				&mtk_crtc->sf_present_fence_wq);
-		}
+		/* 官核在这个分支里只打日志，不推任何 present fence。
+		 *
+		 * 反汇编 mtk_disp_rdma_irq_handler 的 bit5 分支
+		 * (@0xffffff800883a108) 只有 mtk_dprec_logger_pr + printk 两种
+		 * 输出，既没有 atomic_set 也没有 wake_up。而且官核整个 DRM 区域
+		 * 内 sf_pf_event（偏移 0xfb0 = 4016）只被 str wzr 清零过，从来
+		 * 没有一处把它置 1 —— 也就是说 mtk_drm_sf_pf_release_thread 在
+		 * 官核上根本不会被唤醒，那套软件兜底是死代码。
+		 *
+		 * 本树原来在这里推 sf_pf_event，等于在 target_line（一帧的中间）
+		 * 就叫醒释放线程去 signal SurfaceFlinger 的 present fence。SF
+		 * 收到"已经上屏"后立刻提交下一帧，显示配置被以微秒级频率重写，
+		 * OVL/RDMA 每帧都读不完，三个组件一起报错（每 16.7ms 一轮）：
+		 *   OVL0 : frame underflow!
+		 *   RDMA0: abnormal!
+		 *   DSI0 : input relay unfinish
+		 * 正常路径下这条 fence 由 GCE 执行完命令流时 signal，不需要软件
+		 * 兜底，所以去掉它与官核一致，也不会让 SF 卡住。
+		 *
+		 * 注意别和 pf_event（hwcomposer 的 OVL-PF）混：那一条由上面的
+		 * frame_start(bit1) 分支推，本树与官核一致；不推它才会出现
+		 * hwcomposer "[OVL-PF] fence N didn't signal in 200 ms" 黑屏。
+		 */
 	}
 
 	/* TODO: check if this is not necessary */

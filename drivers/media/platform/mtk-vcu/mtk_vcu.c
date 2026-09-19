@@ -444,6 +444,21 @@ int vcu_ipi_send(struct platform_device *pdev,
 		if (!vcu_ptr->abort) {
 			task_lock(vcud_task);
 			send_sig(SIGTERM, vcud_task, 0);
+			/*
+			 * MTK sends SIGKILL right after SIGTERM: vpud does not always
+			 * act on SIGTERM, and without SIGKILL the caller then sits in
+			 * down_interruptible(&vcu_ptr->vpud_killed) for ~45s.
+			 *
+			 * That wait happens on the calling task.  Here it is
+			 * system_server's StorageManagerService handler thread, which
+			 * blocks inside handleSystemReady() ->
+			 * configureTranscoding() -> isHevcDecoderSupported() ->
+			 * MediaCodecList and therefore never gets to run the queued
+			 * H_BOOT_COMPLETED message.  Result: resetIfBootedAndConnected()
+			 * never runs, the emulated volumes are never handed to vold and
+			 * /storage/emulated stays unmounted (screenshots fail).
+			 */
+			send_sig(SIGKILL, vcud_task, 0);
 			task_unlock(vcud_task);
 		}
 		if (vcu_ptr->open_cnt > 0) {

@@ -145,11 +145,15 @@ static int vdec_init(struct mtk_vcodec_ctx *ctx, unsigned long *h_vdec)
 	case V4L2_PIX_FMT_RV30:
 		inst->vcu.id = IPI_VDEC_RV30;
 		break;
+	/*
+	 * The official kernel has no dedicated ipi id for RV40/AV1 -- its
+	 * IPI_VENC_COMMON is 14, so its VDEC ids stop at RV30.  Fall back to the
+	 * generic VDEC ipi rather than listing ids of our own, which would shift
+	 * every encoder id by two and break the vpud handshake.
+	 */
 	case V4L2_PIX_FMT_RV40:
-		inst->vcu.id = IPI_VDEC_RV40;
-		break;
 	case V4L2_PIX_FMT_AV1:
-		inst->vcu.id = IPI_VDEC_AV1;
+		inst->vcu.id = IPI_VDEC_COMMON;
 		break;
 	default:
 		mtk_vcodec_err(inst, "%s no fourcc", __func__);

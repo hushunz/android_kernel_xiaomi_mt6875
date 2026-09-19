@@ -134,8 +134,23 @@ enum ipi_id {
 	IPI_VDEC_MPEG12,
 	IPI_VDEC_WMV,
 	IPI_VDEC_RV30,
-	IPI_VDEC_RV40,
-	IPI_VDEC_AV1,
+	/*
+	 * RV40 and AV1 have no ipi id of their own in the official kernel: its
+	 * ipi_id_to_inst_id() is literally
+	 *     cmp  w0, #0xd
+	 *     cset w0, hi
+	 * so the instance switches at id 14, i.e. IPI_VENC_COMMON == 14, while
+	 * IPI_MAX is 50 there as well (cmp w1, #0x32 in vcu_ipi_register).
+	 *
+	 * Listing these two here pushed IPI_VENC_COMMON to 16.  The AP then sent
+	 * encoder IPIs with id 16, but the vendor vpud -- built against the
+	 * official UAPI -- calls vcu_ipi_get() with id 14 to park its VENC
+	 * receiver.  This kernel's ipi_id_to_inst_id(14) said VDEC, so vpud had
+	 * no thread on the VENC instance at all: the very first encoder IPI
+	 * (IPI_VENC_COMMON, AP_IPIMSG_ENC_QUERY_CAP) timed out after 5s, and the
+	 * caller then sat in down_interruptible(&vpud_killed) for another 45s.
+	 * Keeping the ids at the official values is what fixes that.
+	 */
 	IPI_VENC_COMMON,
 	IPI_VENC_H264,
 	IPI_VENC_H265,

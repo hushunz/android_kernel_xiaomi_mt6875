@@ -868,7 +868,11 @@ static irqreturn_t devapc_violation_irq(int irq_number, void *dev_id)
 	const struct mtk_device_info **device_info;
 	struct mtk_devapc_vio_info *vio_info;
 	int slave_type, vio_idx, index;
-	const char *vio_master;
+	/* The official kernel (and camellian-t-oss) read this in the abnormal
+	 * branch below even when the loop never ran, leaving it uninitialised.
+	 * Default it so that path cannot strncmp() through a garbage pointer.
+	 */
+	const char *vio_master = "UNKNOWN_MASTER";
 	unsigned long flags;
 	uint8_t perm;
 	bool normal;
@@ -948,7 +952,21 @@ static irqreturn_t devapc_violation_irq(int irq_number, void *dev_id)
 	/* It's an abnormal status */
 	pr_info(PFX "WARNING: Abnormal Status\n");
 	print_vio_mask_sta(true);
-	BUG_ON(1);
+	/*
+	 * Match the official kernel, whose code here is exactly
+	 * camellian-t-oss's:
+	 *     strncmp(vio_master, "APMCU_READ", 10) == 0 -> BUG_ON(1)
+	 * (disassembly of devapc_violation_irq: __pi_strncmp with w2 = 0xa on
+	 * vio_master, then cbz w0 -> brk).
+	 *
+	 * This tree had an unconditional BUG_ON(1), so *any* abnormal status --
+	 * including a spurious/misrouted DEVAPC interrupt that no slave type
+	 * reports -- panicked the kernel.  That is what rebooted the device
+	 * while scrolling the gallery: the gallery's Glide loader was simply
+	 * the task running when the interrupt landed.
+	 */
+	if (!strncmp(vio_master, "APMCU_READ", 10))
+		BUG_ON(1);
 
 	spin_unlock_irqrestore(&devapc_lock, flags);
 	return IRQ_HANDLED;

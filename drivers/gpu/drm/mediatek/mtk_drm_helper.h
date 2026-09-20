@@ -58,8 +58,17 @@ enum MTK_DRM_HELPER_OPT {
 	MTK_DRM_OPT_LAYER_REC,
 	MTK_DRM_OPT_CLEAR_LAYER,
 	MTK_DRM_OPT_VDS_PATH_SWITCH,
+	/* 官核 /proc/mtkfb 的 helper 表在这之后还有 index 38/41/42 三项
+	 * （LFR、DYN_MIPI_CHANGE、PQ_34_COLOR_MATRIX），本树整体缺失，
+	 * 于是 MTK_DRM_OPT_NUM 只到 40。而 mtk_drm_helper_init() 的循环
+	 * 上界正是 MTK_DRM_OPT_NUM，所以官核 DTB 里 helper-value[42]=1
+	 * 的 PQ_34_COLOR_MATRIX 永远读不进来，GET_DISPLAY_CAPS 也就报不出
+	 * 0x100 这个能力位。顺序与官核保持一致，值仍按名字匹配。 */
+	MTK_DRM_OPT_LFR,
 	MTK_DRM_OPT_SF_PF,
 	MTK_DRM_OPT_PRIM_DUAL_PIPE,
+	MTK_DRM_OPT_DYN_MIPI_CHANGE,
+	MTK_DRM_OPT_PQ_34_COLOR_MATRIX,
 	MTK_DRM_OPT_NUM
 };
 

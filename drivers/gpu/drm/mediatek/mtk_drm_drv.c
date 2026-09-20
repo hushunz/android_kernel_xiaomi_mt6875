@@ -2204,6 +2204,16 @@ int mtk_drm_get_display_caps_ioctl(struct drm_device *dev, void *data,
 		caps_info->disp_feature_flag |=
 				DRM_DISP_FEATURE_SF_PRESENT_FENCE;
 
+	/* 官核 mtk_drm_get_display_caps_ioctl 反汇编的最后一段（index 0x2a
+	 * 查表 → orr w8, w8, #0x100）：PQ 3x4 色彩矩阵能力位。功能本体在本
+	 * 树里早已存在（mtk_disp_ccorr.c 的
+	 * mtk_drm_ioctl_support_color_matrix，绑在 MTK_SUPPORT_COLOR_TRANSFORM
+	 * 上），之前缺的只是这个 opt 项和能力位本身。 */
+	if (mtk_drm_helper_get_opt(private->helper_opt,
+				   MTK_DRM_OPT_PQ_34_COLOR_MATRIX))
+		caps_info->disp_feature_flag |=
+				DRM_DISP_FEATURE_PQ_34_COLOR_MATRIX;
+
 	return ret;
 }
 

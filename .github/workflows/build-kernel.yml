@@ -45,8 +45,8 @@ jobs:
         export PATH=$GITHUB_WORKSPACE/clang-aosp/google_clang/clang-r383902b-11.0.2/bin:$GITHUB_WORKSPACE/clang-aosp/google_gcc/aarch64-linux-android-4.9/bin:$GITHUB_WORKSPACE/clang-aosp/google_gcc/arm-linux-androideabi-4.9/bin:$PATH
         export KBUILD_BUILD_HOST=Github-Action
         export KBUILD_BUILD_USER=${{ github.actor }}
-        make -j1 LLVM=1 CC=clang O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- vendor/bomb_user_defconfig
-        make -j$(nproc --all) LLVM=1 CC="ccache clang" O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi-
+        make -j1 LLVM=1 CC=clang O=out ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- vendor/bomb_user_defconfig
+        make -j$(nproc --all) LLVM=1 CC="ccache clang" O=out ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi-
 
     - name: Check output
       run: |

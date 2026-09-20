@@ -1947,11 +1947,24 @@ static int check_disp_info(struct drm_mtk_layering_info *disp_info)
 
 		ghead = disp_info->gles_head[disp_idx];
 		gtail = disp_info->gles_tail[disp_idx];
-		if ((ghead < 0 && gtail >= 0) || (gtail < 0 && ghead >= 0)) {
-			dump_disp_info(disp_info, DISP_DEBUG_LEVEL_ERR);
-			DDPPR_ERR("[HRT]gles invalid,disp:%d,head:%d,tail:%d\n",
-				  disp_idx, disp_info->gles_head[disp_idx],
-				  disp_info->gles_tail[disp_idx]);
+		/* 官核 layering_rule_start @0x88a8d84-0x88a8d98 除“一个负一个
+		 * 非负”外还有三条校验：ghead > gtail（区间倒置），以及 ghead
+		 * 或 gtail >= layer_num（越界）；官核错误路径只调
+		 * mtk_dprec_logger_pr，不调 dump_disp_info。本树原先只做了第一
+		 * 条，后果很直接：mtk_is_gles_layer() 的判定是
+		 * gles_head <= idx <= gles_tail，一旦 ghead > gtail 就恒为假，
+		 * 本该交给 GPU 合成的图层会被当成 OVL 图层送去合成，OVL 一帧读
+		 * 不完 —— 正是 DSI buffer underrun / Lx not complete until EOF /
+		 * hw reset 那一组花屏症状；越界时还会拿 ghead 去索引
+		 * input_config[] 读到区间外。 */
+		if ((!((ghead == -1) && (gtail == -1)) &&
+		     !((ghead >= 0) && (gtail >= 0))) ||
+		    (ghead >= disp_info->layer_num[disp_idx]) ||
+		    (gtail >= disp_info->layer_num[disp_idx]) ||
+		    (ghead > gtail)) {
+			DDPPR_ERR("[HRT]gles invalid,disp:%d,head:%d,tail:%d,l_num:%d\n",
+				  disp_idx, ghead, gtail,
+				  disp_info->layer_num[disp_idx]);
 			return -1;
 		}
 	}

@@ -143,8 +143,11 @@ static void mtk_drm_pf_watchdog(struct work_struct *ws)
 		created = atomic_read(&private->crtc_present[i]);
 		released = g_pf_released[i];
 		/* steady state has a 2-fence backlog (commit + config in
-		 * flight); only report when it grows beyond that */
-		if (created - released > 4) {
+		 * flight); only report when it grows beyond that.  VDO 模式
+		 * (frame_trigger_mode=false) 下 pf_event 本来就不推、释放线程
+		 * 设计上不跑，官核同代码同样如此 —— 别把正常现象当 stall。 */
+		if (created - released > 4 &&
+		    mtk_crtc_is_frame_trigger_mode(private->crtc[i])) {
 			pr_notice("MTKDBG FENCE_STALL crtc=%d created=%u released=%u enabled=%d trig_loop=%p\n",
 				  i, created, released,
 				  mtk_crtc->enabled,
@@ -2460,6 +2463,21 @@ static void mtk_crtc_update_ddp_state(struct drm_crtc *crtc,
 			DDPMSG("lyeblob lost ID:%d\n", prop_lye_idx);
 			break;
 		} else if (lyeblob_ids->lye_idx == prop_lye_idx) {
+			/* MTKDBG: 确认 lyeblob 分支是否真的匹配过 —— 匹配时
+			 * mtk_crtc_atmoic_ddp_config (RSZ/PQ addon 连接) 与
+			 * mtk_crtc_get_plane_comp_state 才会执行；若永不匹配，
+			 * 这些与官核的差异就是剩余花屏的候选。 */
+			{
+				static unsigned int lb_cnt;
+
+				if (!(lb_cnt % 300))
+					pr_err("MTKDBG lyeblob match #%u lye=%u prop=%u fw=%u blob=%u\n",
+					       lb_cnt, lyeblob_ids->lye_idx,
+					       prop_lye_idx,
+					       lyeblob_ids->frame_weight,
+					       lyeblob_ids->ddp_blob_id);
+				lb_cnt++;
+			}
 			if (index == 0)
 				mtk_crtc_disp_mode_switch_begin(crtc,
 					old_crtc_state, crtc_state,

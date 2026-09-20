@@ -3138,6 +3138,22 @@ int mtk_layering_rule_ioctl(struct drm_device *dev, void *data,
 	struct drm_mtk_layering_info *disp_info_user = data;
 	int ret;
 
+	/* MTKDBG: 官核 dprec 里 layering_rule_start 跑了 76 次（每次图层
+	 * 场景变化一次），lyeblob 由此建立、mtk_crtc_update_hrt_state 与
+	 * mtk_crtc_atmoic_ddp_config(RSZ/PQ addon 连接) 都由它驱动。成功路径
+	 * 不打 kmsg、dprec 又被 underflow 刷爆，所以这边加一个限流计数，
+	 * 直接确认 A12 HWC 的 MTK_LAYERING_RULE 到底有没有到达本树。 */
+	{
+		static unsigned int lrule_cnt;
+
+		lrule_cnt++;
+		if (lrule_cnt <= 3 || !(lrule_cnt % 50))
+			pr_err("MTKDBG lrule ioctl #%u layer_num=%d/%d/%d\n",
+			       lrule_cnt, disp_info_user->layer_num[0],
+			       disp_info_user->layer_num[1],
+			       disp_info_user->layer_num[2]);
+	}
+
 	ret = layering_rule_start(disp_info_user, 0, dev);
 	if (ret < 0)
 		DDPPR_ERR("layering_rule_start error:%d\n", ret);

@@ -585,9 +585,22 @@ enum MTK_DRM_DISP_FEATURE {
 	DRM_DISP_FEATURE_OUTPUT_ROTATED = 0x00000010,
 	DRM_DISP_FEATURE_THREE_SESSION = 0x00000020,
 	DRM_DISP_FEATURE_FBDC = 0x00000040,
+	/* 以下为官核/A12 补齐：SF_PRESENT_FENCE 是 A12 HWC 判断内核是否
+	 * 支持 SF present fence 的能力位；caps 拿不到或位缺失时 HWC 走
+	 * 降级路径，永远不发 MTK_LAYERING_RULE（探针实测 0 次）。 */
+	DRM_DISP_FEATURE_SF_PRESENT_FENCE = 0x00000080,
+	DRM_DISP_FEATURE_PQ_34_COLOR_MATRIX = 0x00000100,
+	DRM_DISP_FEATURE_MSYNC2_0 = 0x00000200,
+	DRM_DISP_FEATURE_MML_PRIMARY = 0x00000400,
+	DRM_DISP_FEATURE_VIRUTAL_DISPLAY = 0x00000800,
+	DRM_DISP_FEATURE_IOMMU = 0x00001000,
 };
 
 struct mtk_drm_disp_caps_info {
+	/* A12 布局（官核 ioctl 表 0x48 SIZE=40）：开头多了 hw_ver，
+	 * 结尾多了 msync_level_num；缺了它们本树 SIZE=32、cmd 与
+	 * A12 HWC 不匹配，GET_DISPLAY_CAPS 被 DRM 核心静默拒绝。 */
+	unsigned int hw_ver;
 	unsigned int disp_feature_flag;
 	int lcm_degree; /* for rotate180 */
 	unsigned int rsz_in_max[2]; /* for RPO { width, height } */
@@ -597,6 +610,9 @@ struct mtk_drm_disp_caps_info {
 	unsigned int max_luminance;
 	unsigned int average_luminance;
 	unsigned int min_luminance;
+
+	/* Msync2.0 */
+	unsigned int msync_level_num;
 };
 
 struct drm_mtk_session_info {

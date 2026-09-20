@@ -2195,6 +2195,15 @@ int mtk_drm_get_display_caps_ioctl(struct drm_device *dev, void *data,
 	private->HWC_gpid = task_tgid_nr(current);
 #endif
 
+	/* 官核同款：VDO 模式 + SF_PF 开启时，向 A12 HWC 报告内核支持
+	 * SF present fence。HWC 用这个能力位决定是否走内核图层规划
+	 * (MTK_LAYERING_RULE)；之前本树从不设置它，加上 caps 结构体
+	 * 尺寸不对被 DRM 核心拒绝，HWC 因此一直走降级路径。 */
+	if (mtk_drm_helper_get_opt(private->helper_opt, MTK_DRM_OPT_SF_PF) &&
+	    !mtk_crtc_is_frame_trigger_mode(private->crtc[0]))
+		caps_info->disp_feature_flag |=
+				DRM_DISP_FEATURE_SF_PRESENT_FENCE;
+
 	return ret;
 }
 

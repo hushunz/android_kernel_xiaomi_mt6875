@@ -1,0 +1,63 @@
+name: Build Kernel
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CI: "false"
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set swap to 10G
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 10
+
+    - name: Setup build environment
+      run: |
+        echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%Y%m%d%H%M")" >> $GITHUB_ENV
+        sudo apt-get update
+        sudo apt install -y curl llvm lld wget git ccache automake flex bison gperf build-essential zip zlib1g-dev g++-multilib libxml2-utils bc libc6-dev-i386 lib32ncurses5-dev libx11-dev lib32z-dev device-tree-compiler kmod python3 dwarves
+
+    - name: Download clang-r383902b
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/clang-aosp
+        git clone https://github.com/tomxi1997/Toolchain.git clang-aosp --depth=1
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: build-kernel-bomb
+        max-size: 1G
+
+    - name: Build kernel
+      run: |
+        export PATH=$GITHUB_WORKSPACE/clang-aosp/google_clang/clang-r383902b-11.0.2/bin:$GITHUB_WORKSPACE/clang-aosp/google_gcc/aarch64-linux-android-4.9/bin:$GITHUB_WORKSPACE/clang-aosp/google_gcc/arm-linux-androideabi-4.9/bin:$PATH
+        export KBUILD_BUILD_HOST=Github-Action
+        export KBUILD_BUILD_USER=${{ github.actor }}
+        make -j1 LLVM=1 CC=clang O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- vendor/bomb_user_defconfig
+        make -j$(nproc --all) LLVM=1 CC="ccache clang" O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi-
+
+    - name: Check output
+      run: |
+        if [ -f out/arch/arm64/boot/Image.gz ]; then
+            echo "BUILD_OK=true" >> $GITHUB_ENV
+        else
+            echo "Kernel build failed"
+            exit 1
+        fi
+
+    - name: Upload kernel
+      if: env.BUILD_OK == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Image.gz-${{ env.BUILD_TIME }}
+        path: out/arch/arm64/boot/Image.gz

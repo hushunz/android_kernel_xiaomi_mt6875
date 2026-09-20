@@ -524,6 +524,8 @@ struct drm_mtk_layer_config {
 	__u8 secure;
 };
 
+struct mml_frame_info;
+
 struct drm_mtk_layering_info {
 	struct drm_mtk_layer_config *input_config[3];
 	int disp_mode[3];
@@ -537,6 +539,16 @@ struct drm_mtk_layering_info {
 	int res_idx;
 	uint32_t hrt_weight;
 	uint32_t hrt_idx;
+	/* A12 (官方 4.14.186-perf 内核与 OPPO/A12 一致) 在尾部多出这组指针，
+	 * 使 sizeof=128。DRM_IOCTL 编码了 sizeof，A12 HWC 用 128 字节的 cmd
+	 * (0xc0806445) 调 MTK_LAYERING_RULE；本树结构体曾是 104 (cmd
+	 * 0xc0686445)，DRM 核心按 cmd 号不匹配直接拒绝、无任何日志，
+	 * 于是图层规划从未运行：lyeblob 恒为空，mtk_crtc_update_hrt_state /
+	 * mtk_crtc_atmoic_ddp_config(RSZ/PQ addon 连接) 全部不跑 ——
+	 * 官核 dprec 里 layering_rule_start 有 76 次、本树探针实测 0 次。
+	 * 官核 ioctl 表项 (VA 0xffffff8009ab48f0) 的 cmd=0xc0806445
+	 * flags=0x31 SIZE=128，与本结构对齐。 */
+	struct mml_frame_info *mml_cfg[3];
 };
 
 /**

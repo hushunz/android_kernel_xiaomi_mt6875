@@ -2119,21 +2119,6 @@ static unsigned int overlap_to_bw(struct drm_crtc *crtc,
  * per layer in mtk_ovl_layer_config() and are therefore the current frame's
  * numbers by the time the flush path computes the HRT vote.
  */
-#define OVL_HRT_BW_OVERHEAD_PCT 110
-
-static unsigned int mtk_crtc_ovl_frame_bw(struct mtk_drm_crtc *mtk_crtc)
-{
-	struct mtk_ddp_comp *comp;
-	unsigned int total = 0;
-	int i, j;
-
-	for (i = 0; i < DDP_PATH_NR; i++) {
-		for_each_comp_in_crtc_target_path(comp, mtk_crtc, j, i)
-			total += comp->qos_bw + comp->fbdc_bw;
-	}
-
-	return total * OVL_HRT_BW_OVERHEAD_PCT / 100;
-}
 
 static void mtk_crtc_update_hrt_state(struct drm_crtc *crtc,
 				      unsigned int frame_weight,
@@ -2143,18 +2128,22 @@ static void mtk_crtc_update_hrt_state(struct drm_crtc *crtc,
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	struct mtk_crtc_state *crtc_state = to_mtk_crtc_state(crtc->state);
 	struct cmdq_pkt_buffer *cmdq_buf = &(mtk_crtc->gce_obj.buf);
-	unsigned int bw = overlap_to_bw(crtc, frame_weight);
-	unsigned int ovl_bw = mtk_crtc_ovl_frame_bw(mtk_crtc);
-
-	/* MTKDBG: ovl_bw is reported only.  The official kernel votes
-	 * overlap_to_bw() alone, and folding the OVL number into bw is not
-	 * neutral: bw is also stored in qos_ctx->cur_hrt_req, which gates the
-	 * vote update below (mtk_disp_set_hrt_bw() runs only while bw keeps
-	 * growing), and it is what gets written into DISP_SLOT_CUR_HRT_LEVEL
-	 * for the hardware.  Raising it therefore changes both when the vote
-	 * is refreshed and the level the hardware sees. */
-	DDPINFO("%s bw=%d, ovl_bw=%d, last_hrt_req=%d\n",
-		__func__, bw, ovl_bw, mtk_crtc->qos_ctx->last_hrt_req);
+	/* The official kernel's HWC never sends MTK_LAYERING_RULE (probe
+	 * confirmed 0 calls), so this function is never reached from the
+	 * lyeblob path in the official kernel.  Our A12 HWC does send it
+	 * because our UAPI struct size (128) matches its expectation, and
+	 * that drives frame_weight up to 8-10, producing HRT values
+	 * (2520-3150) that inflate SMI ostd 14x above the official kernel
+	 * and cause DSI underrun under memory pressure.
+	 *
+	 * Clamp to 2 (the overlap for a single frame, matching the panel
+	 * baseline that the official kernel's mtk_drm_pan_disp_set_hrt_bw
+	 * uses at CRTC enable).  The lyeblob path still updates
+	 * last_hrt_idx and hrt_cond_sig so the idlemgr/repaint machinery
+	 * works, but the DRAM frequency vote stays at the panel baseline. */
+	unsigned int bw = overlap_to_bw(crtc, 2);
+	DDPINFO("%s fw=%u bw=%d last_hrt_req=%d\n",
+		__func__, frame_weight, bw, mtk_crtc->qos_ctx->last_hrt_req);
 
 	/* Only update HRT information on path with HRT comp */
 	if (bw > mtk_crtc->qos_ctx->cur_hrt_req) {

@@ -209,25 +209,13 @@ static void mtk_drm_cmd_mode_leave_idle(struct drm_crtc *crtc)
 	lcm_fps_ctx_reset(crtc);
 }
 
-static void __maybe_unused mtk_drm_idlemgr_enter_idle_nolock(struct drm_crtc *crtc)
+static void mtk_drm_idlemgr_enter_idle_nolock(struct drm_crtc *crtc)
 {
 	struct mtk_drm_private *priv = crtc->dev->dev_private;
 	struct mtk_ddp_comp *output_comp;
 	int index = drm_crtc_index(crtc);
 
 	bool mode;
-
-	/*
-	 * MTKDBG v79: A12 vendor hwcomposer does not hold a DRM vblank
-	 * refcount the way A11 did, so the A11 idlemgr misjudges the
-	 * display as idle and tears the pipeline down (DSI VFP idle mode
-	 * + IRQ level idle) while composer keeps submitting. The GCE
-	 * commands then stall (cmdq timeout), RDMA frame_done drops to
-	 * one per ~15s, present fences stop signaling and the UI freezes.
-	 * Disable entering idle until the A12 pipeline can handle it.
-	 */
-	DDPPR_ERR("MTKDBG IDLEMGR enter_idle BLOCKED\n");
-	return;
 
 	output_comp = priv->ddp_comp[DDP_COMPONENT_DSI0];
 
@@ -525,14 +513,9 @@ static int mtk_drm_idlemgr_monitor_thread(void *data)
 
 			/* enter idle state */
 			if (!vblank || atomic_read(&vblank->refcount) == 0) {
-				/*
-				 * MTKDBG v79: never mark idle either - the
-				 * leave_idle path also runs GCE commands that
-				 * stall once the pipeline is torn down.
-				 */
-				idlemgr_ctx->idlemgr_last_kick_time =
-					sched_clock();
-				idlemgr_vblank_check_internal = 10;
+				mtk_drm_idlemgr_enter_idle_nolock(crtc);
+				idlemgr_ctx->is_idle = 1;
+				idlemgr_vblank_check_internal = 0;
 			} else {
 				idlemgr_ctx->idlemgr_last_kick_time =
 					sched_clock();

@@ -3305,8 +3305,12 @@ static void mtk_crtc_update_hrt_qos(struct drm_crtc *crtc,
 			mtk_crtc->qos_ctx->last_hrt_req);
 
 #ifdef MTK_FB_MMDVFS_SUPPORT
-		mtk_disp_set_hrt_bw(mtk_crtc,
-				mtk_crtc->qos_ctx->last_hrt_req);
+		/* A12/A13 参照树在这里加了 mtk_crtc->enabled 判断：
+		 * CMDQ 回调在 CRTC 已经关掉的收尾帧里也会跑，那时再投一次
+		 * HRT 会把刚清零的请求重新抬起来。 */
+		if (mtk_crtc->enabled)
+			mtk_disp_set_hrt_bw(mtk_crtc,
+					mtk_crtc->qos_ctx->last_hrt_req);
 #endif
 
 		*(unsigned int *)(cmdq_buf->va_base + DISP_SLOT_CUR_HRT_LEVEL) =

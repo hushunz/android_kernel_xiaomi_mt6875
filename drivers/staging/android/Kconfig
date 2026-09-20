@@ -85,3 +85,9 @@ source "drivers/staging/android/ion/Kconfig"
 endif # if ANDROID
 
 endmenu
+
+config DEBUG_KINFO
+	bool "Debug Kernel Information Support"
+	depends on KALLSYMS
+	help
+	  This supports kernel information backup for bootloader usage.

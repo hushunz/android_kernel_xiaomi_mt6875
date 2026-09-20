@@ -2535,30 +2535,13 @@ static void mtk_crtc_update_ddp_state(struct drm_crtc *crtc,
 	}
 	mutex_unlock(&mtk_drm->lyeblob_list_mutex);
 
-	/* MTKDBG: 官核每次图层变化都会走到上面的 mtk_crtc_update_hrt_state()
-	 * 并逐级聚合上报（官核实测 set HRT bw 76 次 / update_hrt_state 79 次，
-	 * PM_QOS_MM_MEMORY_BW=417，恰等于 DRM 报的 628*133%/2）。
-	 * 本树跑 A12 固件而 HWC 不再下发 MTK_LAYERING_RULE（实测
-	 * layering_rule_start 一次都没执行），lyeblob 列表始终为空、上面的
-	 * 分支永不匹配，于是 HRT 与 MM 带宽一次都不上报：
-	 * PM_QOS_MM_MEMORY_BW 恒为 0（官核 417）-> DVFSRC 的 DDR 仲裁不给
-	 * 显示留带宽 -> OVL 每帧读不完图层(Lx not complete until EOF /
-	 * frame underflow / RDMA abnormal) -> 花屏，且图层越多越严重。
-	 * 这里按本次提交的平面数补一次投票，恢复官核“图层变化即上报”的行为；
-	 * 是否真正发出仍由 update_hrt_state 内部的 (bw > cur_hrt_req) 门槛决定。
-	 */
-	if (index == 0) {
-		u32 pmask = crtc_state->base.plane_mask;
-		unsigned int fw = 0;
-
-		while (pmask) {
-			fw += pmask & 0x1;
-			pmask >>= 1;
-		}
-		if (!fw)
-			fw = pan_disp_frame_weight;
-		mtk_crtc_update_hrt_state(crtc, fw, cmdq_handle);
-	}
+	/* The official kernel does not call mtk_crtc_update_hrt_state from
+	 * atomic_flush -- HRT is set once by mtk_drm_pan_disp_set_hrt_bw at
+	 * CRTC enable, and per-larb BW is updated each frame through the
+	 * PMQOS_SET_BW path in ddp_cmdq_cb.  The old fallback locked
+	 * component HRT requests at a high value (ostd 14x the official),
+	 * causing memory-bus contention under pressure and DSI underrun.
+	 * Removed to match the official kernel. */
 }
 
 #ifdef MTK_DRM_FENCE_SUPPORT

@@ -1313,8 +1313,8 @@ static int check_version(const struct load_info *info,
 			crcval = *crc;
 		if (versions[i].crc == crcval)
 			return 1;
-		pr_debug("Found checksum %X vs module %lX\n",
-			 crcval, versions[i].crc);
+		pr_warn("%s: CRC mismatch for %s: kernel=0x%X module=0x%lX\n",
+			 info->name, symname, crcval, versions[i].crc);
 		goto bad_version;
 	}
 

@@ -1470,8 +1470,14 @@ static int ext_layer_grouping(struct drm_device *dev,
 		for (i = 0; i < disp_info->layer_num[disp_idx]; i++)
 			disp_info->input_config[disp_idx][i].ext_sel_layer = -1;
 
-		if (!get_layering_opt(LYE_OPT_EXT_LAYER))
-			continue;
+		/* A12 official kernel does not produce ext layers even though
+		 * MTK_DRM_OPT_OVL_EXT_LAYER=1.  A11's ext layer grouping
+		 * wastes OVL hardware layer slots under high overlap counts,
+		 * causing RDMA FIFO underrun on OVL0.  Skip ext grouping to
+		 * match the official kernel behaviour — all layers become
+		 * regular physical layers with independent RDMA.
+		 */
+		continue;
 
 #ifndef LAYERING_SUPPORT_EXT_LAYER_ON_2ND_DISP
 		if (disp_idx != HRT_PRIMARY)

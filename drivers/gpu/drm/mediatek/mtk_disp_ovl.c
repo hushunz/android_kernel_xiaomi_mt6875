@@ -1703,10 +1703,23 @@ static void mtk_ovl_layer_config(struct mtk_ddp_comp *comp, unsigned int idx,
 
 		mtk_ovl_layer_on(comp, lye_idx, ext_lye_idx, handle);
 		/*constant color :non RDMA source*/
-		/* TODO: cause RPO abnormal */
-//		if (!pending->addr)
-//			cmdq_pkt_write(handle, comp->cmdq_base,
-//		       comp->regs_pa + DISP_REG_OVL_RDMA_CTRL(idx), 0x0, ~0);
+		/* Disable RDMA for layers without a pixel buffer (dim/C8
+		 * layers).  These layers use OVL constant-color mode and
+		 * do not need RDMA to fetch pixels.  Leaving RDMA enabled
+		 * wastes an RDMA FIFO slot on OVL0, which under high
+		 * layer-count compositing (overlap_num >= 10) can push
+		 * the other layers' RDMA into underrun.
+		 *
+		 * The original A11 code had this commented out with
+		 * "TODO: cause RPO abnormal" — the A12 vendor blob
+		 * submits dim layers that A11 did not, so the RPO issue
+		 * is superseded by the underrun we now see.
+		 */
+		if (!pending->addr)
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				comp->regs_pa +
+				DISP_REG_OVL_RDMA_CTRL(lye_idx),
+				0x0, ~0);
 		/* TODO: consider FBDC */
 		/* SRT BW (one layer) =
 		 * layer_w * layer_h * bpp * vrefresh * max fps blanking_ratio

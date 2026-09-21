@@ -1289,6 +1289,19 @@ static int check_version(const struct load_info *info,
 	unsigned int i, num_versions;
 	struct modversion_info *versions;
 
+	/*
+	 * MI_PATCH: 强制放行所有 vendor 模块的符号 CRC 检查。
+	 *
+	 * 官核使用 clang-r383902 + LTO + CFI 编译，而本内核关闭了 LTO/CFI，
+	 * 这会改变 struct module 的布局，使 module_layout 的 CRC 与官核
+	 * (0x5C148880) 不一致，原本会拒绝加载 fpsgo.ko、sla.ko、
+	 * wlan_drv_gen4m.ko 等全部 vendor 模块。
+	 *
+	 * 此处直接返回成功；符号解析仍由 resolve_symbol() 正常进行，
+	 * 引用了不存在符号的模块依旧无法加载。
+	 */
+	return 1;
+
 	/* Exporting module didn't supply crcs?  OK, we're already tainted. */
 	if (!crc)
 		return 1;

@@ -845,7 +845,11 @@ static void devapc_extra_handler(int slave_type, const char *vio_master,
 		 * thing printed before the kernel dies; at pr_info level it
 		 * never reached the console (pstore console-ramoops) and the
 		 * panic could not be attributed to a subsystem. */
-		pr_err(PFX "Device APC Violation Issue/%s", dispatch_key);
+		pr_err(PFX "Device APC Violation Issue/%s\n", dispatch_key);
+		pr_err(PFX "vio_addr=0x%x master_id=0x%x domain_id=0x%x\n",
+				vio_info->vio_addr, vio_info->master_id,
+				vio_info->domain_id);
+		dump_stack();
 		BUG_ON(id != INFRA_SUBSYS_CONN);
 
 	} else if (dbg_stat->enable_AEE) {

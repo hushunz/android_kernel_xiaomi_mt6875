@@ -1038,6 +1038,64 @@ static long ccu_ioctl(struct file *flip, unsigned int cmd,
 		break;
 	}
 
+	case CCU_IOCTL_WAIT_AFB_IRQ:
+	{
+		/* A12 firmware compat: autofocus burst wait IRQ.
+		 * Struct is 56 bytes (CCU_WAIT_IRQ_STRUCT + 4 padding).
+		 * Same logic as CCU_IOCTL_WAIT_AF_IRQ. */
+		struct CCU_WAIT_IRQ_STRUCT afb_irq;
+
+		if (copy_from_user(&afb_irq, (void *)arg,
+				   sizeof(struct CCU_WAIT_IRQ_STRUCT)) == 0) {
+			if ((afb_irq.Type >= CCU_IRQ_TYPE_AMOUNT)
+				|| (afb_irq.Type < 0)) {
+				ret = -EFAULT;
+				LOG_ERR("invalid type(%d)\n", afb_irq.Type);
+				goto EXIT;
+			}
+
+			if ((afb_irq.bDumpReg >=
+					IMGSENSOR_SENSOR_IDX_MIN_NUM) &&
+				(afb_irq.bDumpReg <
+					IMGSENSOR_SENSOR_IDX_MAX_NUM)) {
+				ret = ccu_AFwaitirq(
+					&afb_irq, afb_irq.bDumpReg);
+			} else {
+				LOG_DBG_MUST(
+				"unknown sensorIdx(%d)(CCU_IOCTL_WAIT_AFB_IRQ)\n",
+					afb_irq.bDumpReg);
+				ret = -EFAULT;
+				goto EXIT;
+			}
+
+			if (copy_to_user((void *)arg, &afb_irq,
+				sizeof(struct CCU_WAIT_IRQ_STRUCT)) != 0) {
+				LOG_ERR("copy_to_user failed\n");
+				ret = -EFAULT;
+			}
+		} else {
+			LOG_ERR("copy_from_user failed\n");
+			ret = -EFAULT;
+		}
+		break;
+	}
+
+	case CCU_IOCTL_SET_AFB_BUF:
+	{
+		/* A12 firmware compat: set AFB buffer count.
+		 * Accept and silently succeed — the official kernel
+		 * allocates CCU internal buffers here but this is
+		 * non-critical for camera preview. */
+		int afb_count;
+
+		if (copy_from_user(&afb_count, (void *)arg,
+				   sizeof(int)) != 0) {
+			LOG_ERR("CCU_IOCTL_SET_AFB_BUF copy_from_user failed\n");
+			ret = -EFAULT;
+		}
+		break;
+	}
+
 	default:
 		LOG_WARN("ioctl:No such command!\n");
 		ret = -EINVAL;

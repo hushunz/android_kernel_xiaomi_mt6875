@@ -522,8 +522,18 @@ void mtk_rdma_cal_golden_setting(struct mtk_ddp_comp *comp,
 #endif
 #if defined(CONFIG_MACH_MT6873) || defined(CONFIG_MACH_MT6853) \
 	|| defined(CONFIG_MACH_MT6833)
-	unsigned int pre_ultra_low_us = 250, pre_ultra_high_us = 260;
-	unsigned int ultra_low_us = 230, ultra_high_us = 250;
+	/* A12 official kernel uses more conservative thresholds (+40us) to
+	 * prevent RDMA FIFO underrun under high layer-count compositing.
+	 * Values verified against official kernel disassembly at
+	 * mtk_rdma_cal_golden_setting (0xffffff8008836b74):
+	 *   pre_ultra_low_us=290, pre_ultra_high_us=300
+	 *   ultra_low_us=270, ultra_high_us=280
+	 * Cross-checked with RDMA0 Golden Setting log:
+	 *   GMC_SETTING_0 [11:0]:912 [27:16]:948  (290/300)
+	 *   GMC_SETTING_1 [11:0]:839 [27:16]:912  (270/280)
+	 */
+	unsigned int pre_ultra_low_us = 290, pre_ultra_high_us = 300;
+	unsigned int ultra_low_us = 270, ultra_high_us = 280;
 	unsigned int urgent_low_us = 110, urgent_high_us = 120;
 #endif
 

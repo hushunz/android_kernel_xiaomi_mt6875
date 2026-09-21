@@ -849,16 +849,18 @@ static void devapc_extra_handler(int slave_type, const char *vio_master,
 		pr_err(PFX "vio_addr=0x%x master_id=0x%x domain_id=0x%x\n",
 				vio_info->vio_addr, vio_info->master_id,
 				vio_info->domain_id);
-		dump_stack();
 		BUG_ON(id != INFRA_SUBSYS_CONN);
 
 	} else if (dbg_stat->enable_AEE) {
 
 		/* call mtk aee_kernel_exception */
 		aee_kernel_exception("[DEVAPC]",
-				"%s%s\n",
+				"%s%s vio_addr=0x%x master_id=0x%x domain_id=0x%x\n",
 				"CRDISPATCH_KEY:Device APC Violation Issue/",
-				dispatch_key
+				dispatch_key,
+				vio_info->vio_addr,
+				vio_info->master_id,
+				vio_info->domain_id
 				);
 
 	} else if (dbg_stat->enable_WARN) {

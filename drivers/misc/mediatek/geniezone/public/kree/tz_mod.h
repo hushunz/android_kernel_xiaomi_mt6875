@@ -67,6 +67,7 @@ struct kree_tee_service_cmd_param {
 	uint32_t command;
 	uint32_t paramTypes;
 	uint64_t param;
+	uint64_t reserved; /* A12 firmware compat: struct is 32 bytes */
 };
 
 /* param for shared memory */

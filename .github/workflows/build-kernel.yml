@@ -29,10 +29,25 @@ jobs:
         sudo apt-get update
         sudo apt install -y curl llvm lld wget git ccache automake flex bison gperf build-essential zip zlib1g-dev g++-multilib libxml2-utils bc libc6-dev-i386 lib32ncurses5-dev libx11-dev lib32z-dev device-tree-compiler kmod python3 dwarves
 
-    - name: Download clang-r383902b
+    - name: Download clang-r383902
       run: |
-        mkdir -p $GITHUB_WORKSPACE/clang-aosp
-        git clone https://github.com/tomxi1997/Toolchain.git clang-aosp --depth=1
+        # 与官核完全一致的 Clang 版本
+        # 官核: Android (6443078 based on r383902) clang version 11.0.1
+        # Git commit: b397f81060ce6d701042b782172ed13bee898b79
+        # 从 AOSP 官方下载 clang-r383902
+        mkdir -p $GITHUB_WORKSPACE/clang-aosp/google_clang
+        cd $GITHUB_WORKSPACE/clang-aosp/google_clang
+        wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/android-11.0.0_r48/clang-r383902.tar.gz
+        mkdir -p clang-r383902 && tar xzf clang-r383902.tar.gz -C clang-r383902
+        rm -f clang-r383902.tar.gz
+        # 下载 GCC 工具链
+        cd $GITHUB_WORKSPACE/clang-aosp
+        wget https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/android-11.0.0_r48.tar.gz -O gcc-aarch64.tar.gz
+        mkdir -p google_gcc/aarch64-linux-android-4.9 && tar xzf gcc-aarch64.tar.gz -C google_gcc/aarch64-linux-android-4.9
+        rm -f gcc-aarch64.tar.gz
+        wget https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/android-11.0.0_r48.tar.gz -O gcc-arm.tar.gz
+        mkdir -p google_gcc/arm-linux-androideabi-4.9 && tar xzf gcc-arm.tar.gz -C google_gcc/arm-linux-androideabi-4.9
+        rm -f gcc-arm.tar.gz
 
     - name: Setup ccache
       uses: hendrikmuhs/ccache-action@v1.2
@@ -42,7 +57,7 @@ jobs:
 
     - name: Build kernel
       run: |
-        export PATH=$GITHUB_WORKSPACE/clang-aosp/google_clang/clang-r383902b-11.0.2/bin:$GITHUB_WORKSPACE/clang-aosp/google_gcc/aarch64-linux-android-4.9/bin:$GITHUB_WORKSPACE/clang-aosp/google_gcc/arm-linux-androideabi-4.9/bin:$PATH
+        export PATH=$GITHUB_WORKSPACE/clang-aosp/google_clang/clang-r383902/bin:$GITHUB_WORKSPACE/clang-aosp/google_gcc/aarch64-linux-android-4.9/bin:$GITHUB_WORKSPACE/clang-aosp/google_gcc/arm-linux-androideabi-4.9/bin:$PATH
         export KBUILD_BUILD_HOST=Github-Action
         export KBUILD_BUILD_USER=${{ github.actor }}
         make -j1 LLVM=1 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip O=out ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- vendor/bomb_user_defconfig

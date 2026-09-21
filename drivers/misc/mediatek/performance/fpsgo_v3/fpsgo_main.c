@@ -40,6 +40,13 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/fpsgo.h>
 
+/* MI_PATCH: Define function pointers here instead of perf_ioctl.c
+ * because LTO keeps them in a different translation unit, making them
+ * invisible to the linker when resolving fpsgo_init references.
+ */
+void (*fpsgo_get_fps_fp)(int *pid, int *fps);
+void (*fpsgo_notify_swap_buffer_fp)(int pid);
+
 #define TARGET_UNLIMITED_FPS 240
 
 enum FPSGO_NOTIFIER_PUSH_TYPE {

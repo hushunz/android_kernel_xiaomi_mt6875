@@ -48,6 +48,12 @@
 #include "ged_kpi.h"
 #endif
 
+/* MI_PATCH: stub for dram_ctl_update_dfrc_fps, originally in dram_ctrl.c.
+ * LTO keeps it in a different translation unit, making it invisible to the
+ * linker when resolving fstb references.  Provide a minimal no-op stub.
+ */
+void dram_ctl_update_dfrc_fps(int fps) { }
+
 #define mtk_fstb_dprintk_always(fmt, args...) \
 	pr_debug("[FSTB]" fmt, ##args)
 

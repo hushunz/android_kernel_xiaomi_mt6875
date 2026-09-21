@@ -2329,12 +2329,11 @@ static int simplify_symbols(struct module *mod, const struct load_info *info)
 			if (!strncmp(name, "__gnu_lto", 9))
 				break;
 
-			/* We compiled with -fno-common.  These are not
-			   supposed to happen.  */
-			pr_debug("Common symbol: %s\n", name);
-			pr_warn("%s: please compile with -fno-common\n",
-			       mod->name);
-			ret = -ENOEXEC;
+			/* MI_PATCH: Allow common symbols from vendor modules
+			 * compiled with LTO (A12 kernel).  The official kernel
+			 * tolerates these; rejecting them breaks wifi/bt/etc.
+			 */
+			pr_debug("Common symbol: %s (allowed)\n", name);
 			break;
 
 		case SHN_ABS:

@@ -1559,11 +1559,13 @@ retry:
 
 		/* Refcounting is expected to be always 0 for free groups */
 		if (unlikely(uc_cpu->group[clamp_id][group_id].tasks)) {
-#ifdef CONFIG_SCHED_DEBUG
-			WARN(1, "invalid CPU[%d] clamp group [%u:%u] refcount: [%u]\n",
-			     cpu, clamp_id, group_id,
-			     uc_cpu->group[clamp_id][group_id].tasks);
-#endif
+			/* MI_PATCH: demote to pr_warn_once to avoid
+			 * call-trace spew when A12 fpsgo boost logic
+			 * triggers inconsistent refcount on A11 uclamp.
+			 */
+			pr_warn_once("uclamp: invalid CPU[%d] clamp group [%u:%u] refcount: [%u]\n",
+				     cpu, clamp_id, group_id,
+				     uc_cpu->group[clamp_id][group_id].tasks);
 			uc_cpu->group[clamp_id][group_id].tasks = 0;
 		}
 

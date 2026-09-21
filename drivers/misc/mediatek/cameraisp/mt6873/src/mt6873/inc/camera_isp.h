@@ -815,6 +815,13 @@ enum ISP_HALT_DMA_ENUM {
 #define ISP_ION_IMPORT                           \
 	_IOW(ISP_MAGIC, ISP_CMD_ION_IMPORT, struct ISP_DEV_ION_NODE_STRUCT)
 
+/* A12 firmware's camerahalserver uses a larger struct (104 bytes) for
+ * ION_IMPORT/FREE ioctls.  The first 12 bytes (devNode, dmaPort, memID)
+ * are identical, so we accept the A12 ioctl number and copy only the
+ * fields we understand. */
+#define ISP_ION_IMPORT_A12 0x40686B1B
+#define ISP_ION_FREE_A12   0x40686B1C
+
 #define ISP_ION_FREE                             \
 	_IOW(ISP_MAGIC, ISP_CMD_ION_FREE, struct ISP_DEV_ION_NODE_STRUCT)
 

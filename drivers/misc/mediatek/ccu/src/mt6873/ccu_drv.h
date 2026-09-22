@@ -337,6 +337,7 @@ struct import_mem_s {
 #define CCU_IOCTL_IMPORT_MEM		        _IOW(CCU_MAGICNO,  27, int)
 #define CCU_IOCTL_UPDATE_QOS_REQUEST        _IOW(CCU_MAGICNO,  28, int)
 #define CCU_IOCTL_UPDATE_CAM_FREQ_REQUEST	_IOW(CCU_MAGICNO,  29, int)
+#define CCU_IOCTL_SET_CAM_BUF               _IOW(CCU_MAGICNO,  30, int)
 #define CCU_IOCTL_WAIT_AFB_IRQ          _IOWR(CCU_MAGICNO,  35, int)
 #define CCU_IOCTL_SET_AFB_BUF           _IOWR(CCU_MAGICNO,  36, int)
 

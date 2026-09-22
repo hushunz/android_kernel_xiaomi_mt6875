@@ -1080,6 +1080,21 @@ static long ccu_ioctl(struct file *flip, unsigned int cmd,
 		break;
 	}
 
+	case CCU_IOCTL_SET_CAM_BUF:
+	{
+		/* A12 firmware compat: camera buffer setup.
+		 * Called after importing2 ION buffers. Accept and
+		 * silently succeed to avoid error-path IRQ double-free. */
+		int cam_buf;
+
+		if (copy_from_user(&cam_buf, (void *)arg,
+				   sizeof(int)) != 0) {
+			LOG_ERR("CCU_IOCTL_SET_CAM_BUF copy_from_user failed\n");
+			ret = -EFAULT;
+		}
+		break;
+	}
+
 	case CCU_IOCTL_SET_AFB_BUF:
 	{
 		/* A12 firmware compat: set AFB buffer count.

@@ -42,6 +42,7 @@
 #define UNIT_TRANS_60 60
 
 #define MAX_TABLE 10
+#define MAX_CHARGE_RDC 5
 
 /* ============================================================ */
 /* power misc related */
@@ -210,6 +211,16 @@ enum Fg_daemon_cmds {
 	FG_DAEMON_CMD_DUMP_LOG,
 	FG_DAEMON_CMD_SEND_DATA,
 	FG_DAEMON_CMD_COMMUNICATION_INT,
+	
+	/* A12/A13 追加的两个命令。A12 的 fuelgauged 加载的
+	 * libfgauge_gm30.so 会发它们（官核上实测：
+	 * "[fr] FG_DAEMON_CMD_SET_BATTERY_CAPACITY = ..." 紧跟着
+	 * "[fg_res] FG_DAEMON_CMD_SET_KERNEL_UISOC = ..."）。A11 内核缺这两项时
+	 * 会走 default 回 status=-1，daemon 判定 FG_DAEMON_CMD mismatch 后
+	 * "fg_daemon will restart"，循环重启、永远发不出 SOC，电量恒为 -1。
+	 * 编号必须与 A12/A13 一致（追加在 COMMUNICATION_INT 之后）。 */
+	FG_DAEMON_CMD_SET_BATTERY_CAPACITY,
+	FG_DAEMON_CMD_GET_BH_DATA,
 
 	FG_DAEMON_CMD_FROM_USER_NUMBER
 };
@@ -230,7 +241,9 @@ enum Fg_kernel_cmds {
 	FG_KERNEL_CMD_REQ_CHANGE_AGING_DATA,
 	FG_KERNEL_CMD_AG_LOG_TEST,
 	FG_KERNEL_CMD_CHG_DECIMAL_RATE,
-
+    FG_KERNEL_CMD_FORCE_BAT_TEMP,
+	FG_KERNEL_CMD_SEND_BH_DATA,
+	
 	FG_KERNEL_CMD_FROM_USER_NUMBER
 
 };
@@ -300,6 +313,12 @@ struct fgd_cmd_param_t_7 {
 	int status;
 };
 
+/* FG_DAEMON_CMD_SET_BATTERY_CAPACITY 的载荷（与 A12/A13 同布局） */
+struct fgd_cmd_param_t_8 {
+	int size;
+	int data[512];
+};
+
 enum daemon_cmd_int_data {
 	FG_GET_NORETURN = 0,
 	FG_GET_SHUTDOWN_CAR = 1,
@@ -310,6 +329,9 @@ enum daemon_cmd_int_data {
 	FG_GET_IS_AGING_RESET = 6,
 	FG_GET_SOC_DECIMAL_RATE = 7,
 	FG_GET_DIFF_SOC_SET = 8,
+	FG_GET_IS_FORCE_FULL = 9,
+	FG_GET_ZCV_INTR_CURR = 10,
+	FG_GET_CHARGE_POWER_SEL = 11,
 	FG_GET_MAX,
 	FG_SET_ANCHOR = 999,
 	FG_SET_SOC = FG_SET_ANCHOR + 1,
@@ -474,6 +496,7 @@ struct fuel_gauge_custom_data {
 	/* ZCV update */
 	int zcv_suspend_time;
 	int sleep_current_avg;
+	int zcv_com_vol_limit;
 
 	int dc_ratio_sel;
 	int dc_r_cnt;
@@ -493,6 +516,17 @@ struct fuel_gauge_custom_data {
 	int ui_full_limit_soc4;
 	int ui_full_limit_ith4;
 	int ui_full_limit_time;
+	
+	int ui_full_limit_fc_soc0;
+	int ui_full_limit_fc_ith0;
+	int ui_full_limit_fc_soc1;
+	int ui_full_limit_fc_ith1;
+	int ui_full_limit_fc_soc2;
+	int ui_full_limit_fc_ith2;
+	int ui_full_limit_fc_soc3;
+	int ui_full_limit_fc_ith3;
+	int ui_full_limit_fc_soc4;
+	int ui_full_limit_fc_ith4;
 
 	/* using voltage to limit uisoc in 1% case */
 	int ui_low_limit_en;
@@ -543,6 +577,22 @@ struct fuel_gauge_custom_data {
 	int power_on_car_chr;
 	int power_on_car_nochr;
 	int shutdown_car_ratio;
+	
+    /* battery health */
+	int aging_diff_max_threshold;
+	int aging_diff_max_level;
+	int aging_factor_t_min;
+	int cycle_diff;
+	int aging_count_min;
+	int default_score;
+	int default_score_quantity;
+	int fast_cycle_set;
+	int level_max_change_bat;
+	int diff_max_change_bat;
+	int aging_tracking_start;
+	int max_aging_data;
+	int max_fast_data;
+	int fast_data_threshold_score;
 
 	/* log_level */
 	int daemon_log_level;
@@ -565,12 +615,24 @@ struct FUELGAUGE_TEMPERATURE {
 	signed int TemperatureR;
 };
 
+/* A12/A13 追加：daemon 会按 sizeof() 校验表结构（14820 -> 39020、664 -> 764），
+ * 缺这些字段时它判定 "FG Version not match" 后反复重启，SOC 永远写不进
+ * 内核（电量恒为 -1）。字段名与顺序照 A13 camellian 逐字对齐。 */
+struct FUELGAUGE_CHARGER_STRUCT {
+	int rdc[MAX_CHARGE_RDC];
+};
+
+struct FUELGAUGE_CHARGE_PSEUDO100_S {
+	int pseudo[MAX_CHARGE_RDC];
+};
+
+
 struct FUELGAUGE_PROFILE_STRUCT {
 	unsigned int mah;
 	unsigned short voltage;
 	unsigned short resistance; /* Ohm*/
-	unsigned short resistance2; /* Ohm*/
-	unsigned short percentage;
+	unsigned int percentage;
+	struct FUELGAUGE_CHARGER_STRUCT charge_r;
 };
 
 struct fuel_gauge_table {
@@ -585,6 +647,7 @@ struct fuel_gauge_table {
 	int shutdown_hl_zcv;
 
 	int size;
+	struct FUELGAUGE_CHARGE_PSEUDO100_S r_pseudo100;
 	struct FUELGAUGE_PROFILE_STRUCT fg_profile[100];
 };
 
@@ -699,6 +762,12 @@ struct simulator_log {
 
 };
 
+/* A12/A13: FG_DAEMON_CMD_GET_BH_DATA 返回的 aging-center 数据 */
+struct ag_center_data_st {
+	int data[43];
+	struct timespec times[3];
+};
+
 struct mtk_battery {
 
 	int fix_coverity;
@@ -729,6 +798,13 @@ struct mtk_battery {
 /*daemon related*/
 	struct sock *daemo_nl_sk;
 	u_int g_fgd_pid;
+	
+/* A12/A13 的 SET_BATTERY_CAPACITY / GET_BH_DATA 需要 */
+	struct ag_center_data_st bh_data;
+	int show_ag;
+	int bat_health;
+	int prev_batt_fcc;
+	int prev_batt_remaining_capacity;
 
 /* gauge hw status
  * exchange data between hw & sw
@@ -759,6 +835,10 @@ struct mtk_battery {
 	bool disable_mtkbattery;
 	bool cmd_disable_nafg;
 	bool ntc_disable_nafg;
+	
+	/*battery full*/
+	bool is_force_full;
+	int charge_power_sel;
 
 /*battery plug out*/
 	bool disable_plug_int;

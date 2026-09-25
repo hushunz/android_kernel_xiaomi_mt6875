@@ -71,6 +71,7 @@
 #include "kd_camera_feature.h"/*for IMGSENSOR_SENSOR_IDX*/
 #include "ccu_mva.h"
 #include "ccu_qos.h"
+#include "ccu_ipc.h"
 
 //for mmdvfs
 #include <linux/pm_qos.h>
@@ -563,7 +564,7 @@ static long ccu_compat_ioctl(struct file *flip,
 }
 #endif
 
-static int ccu_alloc_command(struct ccu_cmd_s **rcmd)
+static int __maybe_unused ccu_alloc_command(struct ccu_cmd_s **rcmd)
 {
 	struct ccu_cmd_s *cmd;
 
@@ -579,7 +580,7 @@ static int ccu_alloc_command(struct ccu_cmd_s **rcmd)
 }
 
 
-static int ccu_free_command(struct ccu_cmd_s *cmd)
+static int __maybe_unused ccu_free_command(struct ccu_cmd_s *cmd)
 {
 	kfree(cmd);
 	return 0;
@@ -649,12 +650,27 @@ static long ccu_ioctl(struct file *flip, unsigned int cmd,
 
 	LOG_DBG("%s+, cmd:%d\n", __func__, cmd);
 
-	if ((cmd != CCU_IOCTL_SET_POWER) && (cmd != CCU_IOCTL_FLUSH_LOG) &&
-		(cmd != CCU_IOCTL_WAIT_IRQ) && (cmd != CCU_IOCTL_IMPORT_MEM)) {
+	/*
+	 * 官核 ccu_ioctl 入口 (0xffffff8008ca940c):
+	 *   if ((cmd | 1) != _IOW('c', 9)) mutex_lock(g_ccu_device + 0x50);
+	 * g_ccu_device + 0x50 = user_mutex, WAIT_AF_IRQ(8)/WAIT_IRQ(9) 不加锁
+	 */
+	if ((cmd | 1) != CCU_IOCTL_WAIT_IRQ)
+		mutex_lock(&g_ccu_device->user_mutex);
+
+	/*
+	 * 官核电源门豁免位图 0x648000200 = {9 WAIT_IRQ, 27 IMPORT_MEM,
+	 * 30 LOAD_CCU_BIN, 33 ALLOC_MEM, 34 DEALLOC_MEM}，
+	 * 另有 SET_POWER(0) 与 FLUSH_LOG(19) 在 region Z 内联判断。
+	 */
+	if (((cmd & 0x648000200U) == 0) &&
+		(cmd != CCU_IOCTL_SET_POWER) &&
+		(cmd != CCU_IOCTL_FLUSH_LOG)) {
 		powert_stat = ccu_query_power_status();
 		if (powert_stat == 0) {
 			LOG_WARN("ccuk: ioctl without powered on\n");
-			return -EFAULT;
+			ret = -EFAULT;
+			goto EXIT;
 		}
 	}
 
@@ -668,72 +684,29 @@ static long ccu_ioctl(struct file *flip, unsigned int cmd,
 		if (ret != 0) {
 			LOG_ERR(
 			"[SET_POWER] copy_from_user failed, ret=%d\n", ret);
-			return -EFAULT;
+			ret = -EFAULT;
+			break;
 		}
-		ret = ccu_set_power(&power);
+		/* 官核 case 0x40046300: 直接调用 ccu_power(&g_power) */
+		ret = ccu_power(&power);
 		LOG_DBG("ccuk: ioctl set powerk-\n");
 		break;
 	}
 
 	case CCU_IOCTL_SET_RUN:
 	{
-		ret = ccu_run();
-		break;
-	}
+		struct ccu_run_s run_info;
 
-	case CCU_IOCTL_ENQUE_COMMAND:
-	{
-		struct ccu_cmd_s *cmd = 0;
-
-		/*allocate ccu_cmd_st_list instead of ccu_cmd_st*/
-		ccu_alloc_command(&cmd);
-		ret = copy_from_user(
-			cmd, (void *)arg, sizeof(struct ccu_cmd_s));
+		/* 官核 case 0x4004630b: copy 24 字节后 ccu_run(&run_info) */
+		ret = copy_from_user(&run_info, (void *)arg,
+			sizeof(struct ccu_run_s));
 		if (ret != 0) {
 			LOG_ERR(
-			"[ENQUE_COMMAND] copy_from_user failed, ret=%d\n", ret);
-			return -EFAULT;
+			"[SET_RUN] copy_from_user failed, ret=%d\n", ret);
+			ret = -EFAULT;
+			break;
 		}
-
-		ret = ccu_push_command_to_queue(user, cmd);
-		break;
-	}
-
-	case CCU_IOCTL_DEQUE_COMMAND:
-	{
-		struct ccu_cmd_s *cmd = 0;
-
-		ret = ccu_pop_command_from_queue(user, &cmd);
-		if (ret != 0) {
-			LOG_ERR(
-			"[DEQUE_COMMAND] pop command failed, ret=%d\n", ret);
-			return -EFAULT;
-		}
-		ret = copy_to_user((void *)arg, cmd, sizeof(struct ccu_cmd_s));
-		if (ret != 0) {
-			LOG_ERR(
-			"[DEQUE_COMMAND] copy_to_user failed, ret=%d\n", ret);
-			return -EFAULT;
-		}
-		ret = ccu_free_command(cmd);
-		if (ret != 0) {
-			LOG_ERR(
-			"[DEQUE_COMMAND] free command, ret=%d\n", ret);
-			return -EFAULT;
-		}
-
-		break;
-	}
-
-	case CCU_IOCTL_FLUSH_COMMAND:
-	{
-		ret = ccu_flush_commands_from_queue(user);
-		if (ret != 0) {
-			LOG_ERR(
-			"[FLUSH_COMMAND] flush command failed, ret=%d\n", ret);
-			return -EFAULT;
-		}
-
+		ret = ccu_run(&run_info);
 		break;
 	}
 
@@ -821,23 +794,6 @@ static long ccu_ioctl(struct file *flip, unsigned int cmd,
 
 		break;
 	}
-	case CCU_IOCTL_SEND_CMD:
-	{	/*--todo: not used for now, remove it*/
-		struct ccu_cmd_s cmd;
-
-		ret = copy_from_user(
-			&cmd, (void *)arg, sizeof(struct ccu_cmd_s));
-
-		if (ret != 0) {
-			LOG_ERR(
-			"[CCU_IOCTL_SEND_CMD] copy_from_user failed, ret=%d\n",
-			ret);
-			return -EFAULT;
-		}
-		ccu_send_command(&cmd);
-		break;
-	}
-
 	case CCU_IOCTL_FLUSH_LOG:
 	{
 		ccu_flushLog(0, NULL);
@@ -864,54 +820,26 @@ static long ccu_ioctl(struct file *flip, unsigned int cmd,
 
 		LOG_DBG_MUST("request freq level: %d\n", freq_level);
 #ifdef CONFIG_MTK_QOS_SUPPORT_ENABLE
-		if (freq_level == CCU_REQ_CAM_FREQ_NONE)
+		/*
+		 * 官核 case 0x4004631d:
+		 *   val == 0 -> cancel_delayed_work_sync(&req.work) + pm_qos(0)
+		 *   val < 6 且 val < _step_size -> cancel work + pm_qos(step[val])
+		 */
+		if (freq_level == CCU_REQ_CAM_FREQ_NONE) {
+			cancel_delayed_work_sync(&_ccu_qos_request.work);
 			pm_qos_update_request(&_ccu_qos_request, 0);
-		else
+		} else if ((freq_level < MAX_FREQ_STEP) &&
+			(freq_level < _step_size)) {
+			cancel_delayed_work_sync(&_ccu_qos_request.work);
 			pm_qos_update_request(&_ccu_qos_request,
 				_g_freq_steps[freq_level]);
+		}
 
 		//use pm_qos_request to get
 		//current freq setting
 		LOG_DBG_MUST("current freq: %d\n",
 			pm_qos_request(PM_QOS_CAM_FREQ));
 #endif
-		break;
-	}
-
-	case CCU_IOCTL_GET_I2C_DMA_BUF_ADDR:
-	{
-		struct ccu_i2c_buf_mva_ioarg ioarg;
-
-		ret = copy_from_user(&ioarg,
-			(void *)arg, sizeof(struct ccu_i2c_buf_mva_ioarg));
-		if (ret != 0) {
-			LOG_ERR(
-			"CCU_IOCTL_GET_I2C_DMA_BUF_ADDR fail: %d\n",
-			ret);
-			ret = -EFAULT;
-		}
-
-		ret = ccu_get_i2c_dma_buf_addr(g_ccu_device, &ioarg);
-		if (ret != 0) {
-			LOG_ERR("ccu_get_i2c_dma_buf_addr fail: %d\n", ret);
-			break;
-		}
-
-		ret = copy_to_user((void *)arg,
-			&ioarg, sizeof(struct ccu_i2c_buf_mva_ioarg));
-
-		break;
-	}
-
-	case CCU_IOCTL_SET_I2C_MODE:
-	{
-		ret = ccu_i2c_controller_init((enum CCU_I2C_CHANNEL)arg);
-
-		if (ret == -1) {
-			LOG_DBG("ccu_i2c_controller_init fail\n");
-			ret = -EINVAL;
-		}
-
 		break;
 	}
 
@@ -923,18 +851,6 @@ static long ccu_ioctl(struct file *flip, unsigned int cmd,
 
 		ret = copy_to_user((void *)arg, &current_fps_list,
 			sizeof(int32_t) * IMGSENSOR_SENSOR_IDX_MAX_NUM);
-
-		break;
-	}
-
-	case CCU_IOCTL_GET_SENSOR_I2C_SLAVE_ADDR:
-	{
-			int32_t sensorI2cSlaveAddr[5];
-
-		ccu_get_sensor_i2c_slave_addr(&sensorI2cSlaveAddr[0]);
-
-		ret = copy_to_user((void *)arg,
-				&sensorI2cSlaveAddr, sizeof(int32_t) * 5);
 
 		break;
 	}
@@ -998,8 +914,44 @@ static long ccu_ioctl(struct file *flip, unsigned int cmd,
 	case CCU_READ_REGISTER:
 	{
 		int regToRead = (int)arg;
+		long regVal;
 
-		return ccu_read_info_reg(regToRead);
+		/*
+		 * 官核 case 0xc004630e: arg<0x20 时返回
+		 * *(ccu_base + arg*4 + 0x80)，否则打印后返回 0；
+		 * 该值直接作为 ioctl 返回值，故需先释放 user_mutex。
+		 */
+		if ((unsigned int)regToRead < 0x20)
+			regVal = ccu_read_info_reg(regToRead);
+		else {
+			LOG_ERR("read register index out of range: %d\n",
+				regToRead);
+			regVal = 0;
+		}
+		mutex_unlock(&g_ccu_device->user_mutex);
+		return regVal;
+	}
+
+	case CCU_WRITE_REGISTER:
+	{
+		struct {
+			uint32_t reg;
+			uint32_t val;
+		} reg32;
+
+		/* 官核 case 0xc004630f: copy 8 字节, reg<0x20 才写 */
+		ret = copy_from_user(&reg32, (void *)arg, sizeof(reg32));
+		if (ret != 0) {
+			ret = -EFAULT;
+			break;
+		}
+		if (reg32.reg < 0x20)
+			ccu_write_info_reg(reg32.reg, reg32.val);
+		else
+			LOG_ERR("write register index out of range: %d\n",
+				reg32.reg);
+		ret = 0;
+		break;
 	}
 
 	case CCU_IOCTL_IMPORT_MEM:
@@ -1038,76 +990,238 @@ static long ccu_ioctl(struct file *flip, unsigned int cmd,
 		break;
 	}
 
-	case CCU_IOCTL_WAIT_AFB_IRQ:
+	case CCU_IOCTL_LOAD_CCU_BIN:
 	{
-		/* A12 firmware compat: autofocus burst wait IRQ.
-		 * Struct is 56 bytes (CCU_WAIT_IRQ_STRUCT + 4 padding).
-		 * Same logic as CCU_IOCTL_WAIT_AF_IRQ. */
-		struct CCU_WAIT_IRQ_STRUCT afb_irq;
+		enum CCU_BIN_TYPE type;
 
-		if (copy_from_user(&afb_irq, (void *)arg,
-				   sizeof(struct CCU_WAIT_IRQ_STRUCT)) == 0) {
-			if ((afb_irq.Type >= CCU_IRQ_TYPE_AMOUNT)
-				|| (afb_irq.Type < 0)) {
+		/*
+		 * 官核 case 0x4004631e:
+		 *   copy 4 字节 type; (type | power_status) != 0 时调用
+		 *   ccu_load_bin(g_ccu_device, type)，否则 -EFAULT
+		 */
+		ret = copy_from_user(&type, (void *)arg,
+			sizeof(enum CCU_BIN_TYPE));
+		if (ret != 0) {
+			LOG_ERR(
+			"[LOAD_CCU_BIN] copy_from_user failed, ret=%d\n", ret);
+			ret = -EFAULT;
+			break;
+		}
+		LOG_INF_MUST("load ccu bin %d\n", type);
+		if (((uint32_t)type |
+			(uint32_t)ccu_query_power_status()) != 0) {
+			ret = ccu_load_bin(g_ccu_device, type);
+		} else {
+			LOG_ERR("ccu_load_bin without powered on\n");
+			ret = -EFAULT;
+		}
+		break;
+	}
+
+	case CCU_IOCTL_IPC_SEND_CMD:
+	{
+		struct ccu_control_info msg;
+		uint32_t *indata = NULL;
+		uint32_t *outdata = NULL;
+
+		/*
+		 * 官核 case 0x40046320 (0x1400 in / 0x800 out):
+		 *   copy 48 字节 ccu_control_info;
+		 *   inDataSize < 0x1401 才继续，copy in -> ccuControl ->
+		 *   outDataSize <= 0x800 才 copy out
+		 */
+		indata = kmalloc(CCU_IPC_IBUF_CAPACITY, GFP_KERNEL);
+		outdata = kmalloc(CCU_IPC_OBUF_CAPACITY, GFP_KERNEL);
+		if ((indata == NULL) || (outdata == NULL)) {
+			kfree(indata);
+			kfree(outdata);
+			ret = -ENOMEM;
+			break;
+		}
+
+		ret = copy_from_user(&msg, (void *)arg,
+			sizeof(struct ccu_control_info));
+		if (ret != 0) {
+			LOG_ERR(
+			"CCU_IOCTL_IPC_SEND_CMD copy_from_user failed: %d\n",
+			ret);
+			kfree(indata);
+			kfree(outdata);
+			ret = -EFAULT;
+			break;
+		}
+
+		if (msg.inDataSize < 0x1401) {
+			ret = copy_from_user(indata,
+				(void *)msg.inDataPtr, msg.inDataSize);
+			if (ret != 0) {
+				LOG_ERR(
+				"CCU_IOCTL_IPC_SEND_CMD copy in failed: %d\n",
+				ret);
+				kfree(indata);
+				kfree(outdata);
 				ret = -EFAULT;
-				LOG_ERR("invalid type(%d)\n", afb_irq.Type);
-				goto EXIT;
+				break;
 			}
 
-			if ((afb_irq.bDumpReg >=
-					IMGSENSOR_SENSOR_IDX_MIN_NUM) &&
-				(afb_irq.bDumpReg <
-					IMGSENSOR_SENSOR_IDX_MAX_NUM)) {
-				ret = ccu_AFwaitirq(
-					&afb_irq, afb_irq.bDumpReg);
+			ccuControl(
+				msg.feature_type,
+				(enum IMGSENSOR_SENSOR_IDX)msg.sensor_idx,
+				msg.msg_id, indata, msg.inDataSize,
+				outdata, msg.outDataSize);
+
+			if (msg.outDataSize > 0x800) {
+				ret = -EINVAL;
 			} else {
-				LOG_DBG_MUST(
-				"unknown sensorIdx(%d)(CCU_IOCTL_WAIT_AFB_IRQ)\n",
-					afb_irq.bDumpReg);
-				ret = -EFAULT;
-				goto EXIT;
-			}
-
-			if (copy_to_user((void *)arg, &afb_irq,
-				sizeof(struct CCU_WAIT_IRQ_STRUCT)) != 0) {
-				LOG_ERR("copy_to_user failed\n");
-				ret = -EFAULT;
+				ret = copy_to_user((void *)msg.outDataPtr,
+					outdata, msg.outDataSize);
+				if (ret != 0)
+					ret = -EFAULT;
 			}
 		} else {
-			LOG_ERR("copy_from_user failed\n");
+			ret = -EINVAL;
+		}
+
+		kfree(indata);
+		kfree(outdata);
+		break;
+	}
+
+	case CCU_IOCTL_ALLOC_MEM:
+	{
+		struct CcuMemHandle handle;
+
+		/* 官核 case 0x40046321: copy 40 字节 CcuMemInfo,
+		 * ccu_allocate_mem(&handle, size, cached)，不回写用户内存 */
+		handle.ionHandleKd = NULL;
+		ret = copy_from_user(&handle.meminfo, (void *)arg,
+			sizeof(struct CcuMemInfo));
+		if (ret != 0) {
+			LOG_ERR(
+			"CCU_IOCTL_ALLOC_MEM copy_from_user failed: %d\n",
+			ret);
+			ret = -EFAULT;
+			break;
+		}
+
+		ret = ccu_allocate_mem(&handle, handle.meminfo.size,
+			handle.meminfo.cached);
+		if (ret != 0)
+			LOG_ERR("CCU_IOCTL_ALLOC_MEM fail: %d\n", ret);
+		break;
+	}
+
+	case CCU_IOCTL_DEALLOC_MEM:
+	{
+		struct CcuMemHandle handle;
+
+		/* 官核 case 0x40046322: copy 40 字节 -> ccu_deallocate_mem
+		 * -> 回写 0x28 字节 CcuMemInfo */
+		handle.ionHandleKd = NULL;
+		ret = copy_from_user(&handle.meminfo, (void *)arg,
+			sizeof(struct CcuMemInfo));
+		if (ret != 0) {
+			LOG_ERR(
+			"CCU_IOCTL_DEALLOC_MEM copy_from_user failed: %d\n",
+			ret);
+			ret = -EFAULT;
+			break;
+		}
+
+		ret = ccu_deallocate_mem(&handle);
+		if (ret != 0) {
+			LOG_ERR("CCU_IOCTL_DEALLOC_MEM fail: %d\n", ret);
+			break;
+		}
+
+		ret = copy_to_user((void *)arg, &handle.meminfo,
+			sizeof(struct CcuMemInfo));
+		if (ret != 0) {
+			LOG_ERR(
+			"CCU_IOCTL_DEALLOC_MEM copy_to_user failed: %d\n",
+			ret);
 			ret = -EFAULT;
 		}
 		break;
 	}
 
-	case CCU_IOCTL_SET_CAM_BUF:
+	case CCU_IOCTL_READ_STRUCT_SIZE:
 	{
-		/* A12 firmware compat: camera buffer setup.
-		 * Called after importing2 ION buffers. Accept and
-		 * silently succeed to avoid error-path IRQ double-free. */
-		int cam_buf;
+		uint32_t count = 0;
+		uint32_t *struct_size = NULL;
 
-		if (copy_from_user(&cam_buf, (void *)arg,
-				   sizeof(int)) != 0) {
-			LOG_ERR("CCU_IOCTL_SET_CAM_BUF copy_from_user failed\n");
+		/*
+		 * 官核 case 0xc0046324: copy 4 字节 count ->
+		 * kmalloc(count<<2) -> 从 SPREG_10(0xa8) 指向的 CCU 内存
+		 * 读取 count 个结构体大小 -> count<7 时回写用户
+		 */
+		ret = copy_from_user(&count, (void *)arg,
+			sizeof(uint32_t));
+		if (ret != 0) {
 			ret = -EFAULT;
+			break;
 		}
+
+		struct_size = kmalloc((count << 2), GFP_KERNEL);
+		if (struct_size == NULL) {
+			LOG_ERR("CCU_IOCTL_READ_STRUCT_SIZE kmalloc failed\n");
+			ret = -ENOMEM;
+			break;
+		}
+
+		ret = ccu_read_struct_size(struct_size, count);
+		if (ret == 0) {
+			ret = copy_to_user((void *)arg, struct_size,
+				count << 2);
+			if (ret != 0)
+				ret = -EFAULT;
+		}
+
+		kfree(struct_size);
 		break;
 	}
 
-	case CCU_IOCTL_SET_AFB_BUF:
+	case CCU_IOCTL_PRINT_REG:
 	{
-		/* A12 firmware compat: set AFB buffer count.
-		 * Accept and silently succeed — the official kernel
-		 * allocates CCU internal buffers here but this is
-		 * non-critical for camera preview. */
-		int afb_count;
+		uint32_t *reg_buf = NULL;
+		uint32_t dump_size = CCU_HW_DUMP_SIZE + CCU_DMEM_SIZE +
+			CCU_PMEM_SIZE;
 
-		if (copy_from_user(&afb_count, (void *)arg,
-				   sizeof(int)) != 0) {
-			LOG_ERR("CCU_IOCTL_SET_AFB_BUF copy_from_user failed\n");
-			ret = -EFAULT;
+		/* 官核 case 0x80046325: kmalloc(0x40550) + ccu_print_reg
+		 * + copy_to_user(0x40550) */
+		reg_buf = kmalloc(dump_size, GFP_KERNEL);
+		if (reg_buf == NULL) {
+			ret = -ENOMEM;
+			break;
 		}
+
+		ccu_print_reg(reg_buf);
+		ret = copy_to_user((void *)arg, reg_buf, dump_size);
+		if (ret != 0)
+			ret = -EFAULT;
+
+		kfree(reg_buf);
+		break;
+	}
+
+	case CCU_IOCTL_PRINT_SRAM_LOG:
+	{
+		char *log_buf = NULL;
+
+		/* 官核 case 0x80046326: kmalloc(0x1400) + ccu_print_sram_log
+		 * + copy_to_user(0x1400) */
+		log_buf = kmalloc(0x1400, GFP_KERNEL);
+		if (log_buf == NULL) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		ccu_print_sram_log(log_buf);
+		ret = copy_to_user((void *)arg, log_buf, 0x1400);
+		if (ret != 0)
+			ret = -EFAULT;
+
+		kfree(log_buf);
 		break;
 	}
 
@@ -1126,6 +1240,10 @@ EXIT:
 		"fail, (process, pid, tgid)=(%s, %d, %d)\n",
 			current->comm, current->pid, current->tgid);
 	}
+
+	/* 官核出口: WAIT_AF_IRQ/WAIT_IRQ 未加锁, 其余解锁 */
+	if ((cmd | 1) != CCU_IOCTL_WAIT_IRQ)
+		mutex_unlock(&g_ccu_device->user_mutex);
 
 	return ret;
 }
@@ -1367,6 +1485,21 @@ if ((strcmp("ccu", g_ccu_device->dev->of_node->name) == 0)) {
 #endif
 	LOG_INF("dmem_base pa: 0x%x, size: 0x%x\n", phy_addr, phy_size);
 	LOG_INF("dmem_base va: 0x%lx\n", g_ccu_device->dmem_base);
+
+	/*remap bin_base (PMEM/IMEM)*/
+	/* 官核 ccu_da_to_va: da < 0x10000000 的段(DP_BIN)映射到 IMEM,
+	 * 官核该基址全局非 0, A11 之前未 ioremap, 必须补齐 */
+	phy_addr = CCU_PMEM_BASE;
+	phy_size = CCU_PMEM_SIZE;
+#ifdef CCU_LDVT
+	g_ccu_device->bin_base =
+		(unsigned long)ioremap_wc(phy_addr, phy_size);
+#else
+	g_ccu_device->bin_base =
+		(unsigned long)ioremap(phy_addr, phy_size);
+#endif
+	LOG_INF("bin_base pa: 0x%x, size: 0x%x\n", phy_addr, phy_size);
+	LOG_INF("bin_base va: 0x%lx\n", g_ccu_device->bin_base);
 
 	/*remap camsys_base*/
 	phy_addr = CCU_CAMSYS_BASE;

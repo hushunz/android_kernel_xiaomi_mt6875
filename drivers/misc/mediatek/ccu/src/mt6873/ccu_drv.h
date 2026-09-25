@@ -293,6 +293,22 @@ struct ccu_cmd_s {
 	enum ccu_eng_status_e status;
 };
 
+/* 官核 CCU_IOCTL_SET_RUN copy 大小 = 24B (0x18) */
+struct ccu_run_s {
+	uint32_t log_level;
+	uint32_t log_taglevel;
+	uint32_t CtrlBufMva;
+	uint32_t CpuRefBufMva;
+	uint32_t CpuRefBufSz;
+	uint32_t bkdata_ddr_buf_mva;
+};
+
+/* 官核 CCU_IOCTL_LOAD_CCU_BIN copy 大小 = 4B */
+enum CCU_BIN_TYPE {
+	CCU_DP_BIN,
+	CCU_DDR_BIN
+};
+
 #define CCU_IMPORT_BUF_NUM 200
 #define CCU_IMPORT_BUF_UNDEF 0xFFFFFFFF
 struct import_mem_s {
@@ -318,7 +334,7 @@ struct import_mem_s {
 #define CCU_IOCTL_WAIT_AF_IRQ               _IOW(CCU_MAGICNO,   8, int)
 #define CCU_IOCTL_WAIT_IRQ                  _IOW(CCU_MAGICNO,   9, int)
 #define CCU_IOCTL_SEND_CMD                  _IOWR(CCU_MAGICNO, 10, int)
-#define CCU_IOCTL_SET_RUN                   _IO(CCU_MAGICNO,   11)
+#define CCU_IOCTL_SET_RUN                   _IOW(CCU_MAGICNO,  11, int)
 
 #define CCU_CLEAR_IRQ                       _IOW(CCU_MAGICNO,  12, int)
 #define CCU_REGISTER_IRQ_USER_KEY           _IOR(CCU_MAGICNO,  13, int)
@@ -337,8 +353,13 @@ struct import_mem_s {
 #define CCU_IOCTL_IMPORT_MEM		        _IOW(CCU_MAGICNO,  27, int)
 #define CCU_IOCTL_UPDATE_QOS_REQUEST        _IOW(CCU_MAGICNO,  28, int)
 #define CCU_IOCTL_UPDATE_CAM_FREQ_REQUEST	_IOW(CCU_MAGICNO,  29, int)
-#define CCU_IOCTL_SET_CAM_BUF               _IOW(CCU_MAGICNO,  30, int)
-#define CCU_IOCTL_WAIT_AFB_IRQ          _IOWR(CCU_MAGICNO,  35, int)
-#define CCU_IOCTL_SET_AFB_BUF           _IOWR(CCU_MAGICNO,  36, int)
+#define CCU_IOCTL_LOAD_CCU_BIN              _IOW(CCU_MAGICNO,  30, int)
+#define CCU_IOCTL_IPC_SEND_CMD              _IOW(CCU_MAGICNO,  32, int)
+#define CCU_IOCTL_ALLOC_MEM                 _IOW(CCU_MAGICNO,  33, int)
+#define CCU_IOCTL_DEALLOC_MEM               _IOW(CCU_MAGICNO,  34, int)
+/* 官核对 cmd35 一律返回 -EINVAL "No such command"，不定义 35 */
+#define CCU_IOCTL_READ_STRUCT_SIZE          _IOWR(CCU_MAGICNO,  36, int)
+#define CCU_IOCTL_PRINT_REG                 _IOR(CCU_MAGICNO,  37, int)
+#define CCU_IOCTL_PRINT_SRAM_LOG            _IOR(CCU_MAGICNO,  38, int)
 
 #endif

@@ -33,4 +33,36 @@ int ccu_deallocate_mva(struct ion_handle **handle);
 struct ion_handle *ccu_ion_import_handle(int fd);
 void ccu_ion_free_import_handle(struct ion_handle *handle);
 
+/*
+ * 官核 struct CcuMemInfo = 40B (0x28)，布局(以官核反汇编访问偏移为准):
+ *   shareFd       @0x00
+ *   va            @0x08
+ *   align_mva     @0x10
+ *   mva           @0x14
+ *   size          @0x18
+ *   occupiedSize  @0x1c
+ *   cached        @0x20 (官核按 u32 读写)
+ *   dump_time     @0x24 (官核按 char 读: >10MB 分配时打计时日志)
+ */
+struct CcuMemInfo {
+	int shareFd;
+	char *va;
+	uint32_t align_mva;
+	uint32_t mva;
+	uint32_t size;
+	uint32_t occupiedSize;
+	uint32_t cached;
+	uint8_t dump_time;
+};
+
+/* 官核 sizeof(struct CcuMemHandle) = 48B (0x30) */
+struct CcuMemHandle {
+	struct ion_handle *ionHandleKd;
+	struct CcuMemInfo meminfo;
+};
+
+int ccu_allocate_mem(struct CcuMemHandle *memHandle, int size, bool cached);
+int ccu_deallocate_mem(struct CcuMemHandle *memHandle);
+struct CcuMemInfo *ccu_get_binary_memory(void);
+
 #endif

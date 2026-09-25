@@ -51,6 +51,8 @@
 #include "scp_reservedmem_define.h"
 #endif
 
+#include <linux/arm-smccc.h>
+
 #if ENABLE_SCP_EMI_PROTECTION
 #include "memory/mediatek/emi.h"
 #endif
@@ -218,20 +220,19 @@ void memcpy_from_scp(void *trg, const void __iomem *src, int size)
 /*
  * acquire a hardware semaphore
  * @param flag: semaphore id
- * return  0 :get sema success
- *         1 :get sema timeout
- *        -1 :get sema fail, driver not ready
+ * return  1 :get sema success
+ *        -1 :get sema timeout
  */
 int get_scp_semaphore(int flag)
 {
 	int read_back;
-	unsigned int cnt;
-	int ret = SEMAPHORE_FAIL;
+	int count = 0;
+	int ret = -1;
 	unsigned long spin_flags;
 
-	/* return -1 to prevent from access when driver not ready */
+	/* return 1 to prevent from access when driver not ready */
 	if (!driver_init_done)
-		return SEMAPHORE_NOT_INIT;
+		return -1;
 
 	/* spinlock context safe*/
 	spin_lock_irqsave(&scp_awake_spinlock, spin_flags);
@@ -241,23 +242,23 @@ int get_scp_semaphore(int flag)
 	read_back = (readl(SCP_SEMAPHORE) >> flag) & 0x1;
 
 	if (read_back == 0) {
-		cnt = SEMAPHORE_TIMEOUT;
 		writel((1 << flag), SCP_SEMAPHORE);
 
-		while (cnt-- > 0) {
+		while (count != SEMAPHORE_TIMEOUT) {
 			/* repeat test if we get semaphore */
 			read_back = (readl(SCP_SEMAPHORE) >> flag) & 0x1;
 			if (read_back == 1) {
-				ret = SEMAPHORE_SUCCESS;
+				ret = 1;
 				break;
 			}
 			writel((1 << flag), SCP_SEMAPHORE);
+			count++;
 		}
 
-		if (ret == SEMAPHORE_FAIL)
-			pr_notice("[SCP] get scp sema. %d TIMEOUT...!\n", flag);
+		if (ret < 0)
+			pr_debug("[SCP] get scp sema. %d TIMEOUT...!\n", flag);
 	} else {
-		pr_notice("[SCP] already hold scp sema. %d\n", flag);
+		pr_err("[SCP] already hold scp sema. %d\n", flag);
 	}
 
 	spin_unlock_irqrestore(&scp_awake_spinlock, spin_flags);
@@ -269,19 +270,18 @@ EXPORT_SYMBOL_GPL(get_scp_semaphore);
 /*
  * release a hardware semaphore
  * @param flag: semaphore id
- * return  0 :release sema success
- *         1 :release sema fail
- *        -1 :release sema fail, driver not ready
+ * return  1 :release sema success
+ *        -1 :release sema fail
  */
 int release_scp_semaphore(int flag)
 {
 	int read_back;
-	int ret = SEMAPHORE_FAIL;
+	int ret = -1;
 	unsigned long spin_flags;
 
-	/* return -1 to prevent from access when driver not ready */
+	/* return 1 to prevent from access when driver not ready */
 	if (!driver_init_done)
-		return SEMAPHORE_NOT_INIT;
+		return -1;
 
 	/* spinlock context safe*/
 	spin_lock_irqsave(&scp_awake_spinlock, spin_flags);
@@ -294,11 +294,11 @@ int release_scp_semaphore(int flag)
 		writel((1 << flag), SCP_SEMAPHORE);
 		read_back = (readl(SCP_SEMAPHORE) >> flag) & 0x1;
 		if (read_back == 0)
-			ret = SEMAPHORE_SUCCESS;
+			ret = 1;
 		else
-			pr_notice("[SCP] release scp sema. %d failed\n", flag);
+			pr_debug("[SCP] release scp sema. %d failed\n", flag);
 	} else {
-		pr_notice("[SCP] try to release sema. %d not own by me\n", flag);
+		pr_err("[SCP] try to release sema. %d not own by me\n", flag);
 	}
 
 	spin_unlock_irqrestore(&scp_awake_spinlock, spin_flags);
@@ -307,94 +307,6 @@ int release_scp_semaphore(int flag)
 }
 EXPORT_SYMBOL_GPL(release_scp_semaphore);
 
-/*
- * acquire a hardware semaphore
- * @param flag: semaphore id
- * return 0: get sema success
- *        1: get sema timeout
- *       -1: get sema fail, driver not ready
- */
-int scp_get_semaphore_3way(int flag)
-{
-	int ret = SEMAPHORE_FAIL;
-	unsigned int cnt;
-	unsigned long spin_flags;
-	unsigned int read_back;
-
-	/* return -1 to prevent from access when driver not ready */
-	if (!driver_init_done)
-		return SEMAPHORE_NOT_INIT;
-
-	/* spinlock context safe*/
-	spin_lock_irqsave(&scp_awake_spinlock, spin_flags);
-
-	flag = flag * 4 + 2;
-
-	read_back = (readl(SCP_3WAY_SEMAPHORE) >> flag) & 0x1;
-	if (read_back == 0) {
-		cnt = SEMAPHORE_3WAY_TIMEOUT;
-
-		while (cnt-- > 0) {
-			writel((1 << flag), SCP_3WAY_SEMAPHORE);
-
-			read_back = (readl(SCP_3WAY_SEMAPHORE) >> flag) & 0x1;
-			if (read_back == 1) {
-				ret = SEMAPHORE_SUCCESS;
-				break;
-			}
-
-		}
-		if (ret == SEMAPHORE_FAIL)
-			pr_notice("[SCP] get scp sema. %d TIMEOUT...!\n", flag);
-	} else {
-		pr_notice("[SCP] already hold scp sema. %d\n", flag);
-	}
-
-	spin_unlock_irqrestore(&scp_awake_spinlock, spin_flags);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(scp_get_semaphore_3way);
-
-/*
- * release a hardware semaphore
- * @param flag: semaphore id
- * return 0: release sema success
- *        1: release sema fail, sem busy
- *       -1: release sema fail, driver not ready
- */
-int scp_release_semaphore_3way(int flag)
-{
-	int ret = SEMAPHORE_FAIL;
-	unsigned long spin_flags;
-	unsigned int read_back;
-
-	/* return -1 to prevent from access when driver not ready */
-	if (!driver_init_done)
-		return SEMAPHORE_NOT_INIT;
-
-	/* spinlock context safe*/
-	spin_lock_irqsave(&scp_awake_spinlock, spin_flags);
-
-	flag = flag * 4 + 2;
-
-	read_back = (readl(SCP_3WAY_SEMAPHORE) >> flag) & 0x1;
-	if (read_back == 1) {
-		writel((1 << flag), SCP_3WAY_SEMAPHORE);
-		read_back = (readl(SCP_3WAY_SEMAPHORE) >> flag) & 0x1;
-		if (read_back == 0)
-			ret = SEMAPHORE_SUCCESS;
-		else
-			pr_notice("[SCP] release scp sema. %d failed\n", flag);
-	} else {
-		pr_notice("[SCP] try to release sema. %d not own by me\n", flag);
-	}
-
-	spin_unlock_irqrestore(&scp_awake_spinlock, spin_flags);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(scp_release_semaphore_3way);
 
 static BLOCKING_NOTIFIER_HEAD(scp_A_notifier_list);
 /*
@@ -465,6 +377,7 @@ static void scp_A_notify_ws(struct work_struct *ws)
 	unsigned int scp_notify_flag = sws->flags;
 
 
+
 	if (scp_notify_flag) {
 		scp_recovery_flag[SCP_A_ID] = SCP_A_RECOVERY_OK;
 
@@ -478,13 +391,16 @@ static void scp_A_notify_ws(struct work_struct *ws)
 
 #if SCP_DVFS_INIT_ENABLE
 #ifdef ULPOSC_CALI_BY_AP
+		/* A12 calls this unconditionally (no core-halt guard):
+		 * the ULPOSC2 cali data must reach SCP or DVFS / the
+		 * C_SLEEP IPI path stays broken.
+		 */
 		sync_ulposc_cali_data_to_scp();
 #endif
-		/* release pll clock after scp ulposc calibration */
 		scp_pll_ctrl_set(PLL_DISABLE, CLK_26M);
+		scp_dvfs_cali_ready = 1;
 #endif
 
-		scp_dvfs_cali_ready = 1;
 		pr_debug("[SCP] notify blocking call\n");
 		blocking_notifier_call_chain(&scp_A_notifier_list
 			, SCP_EVENT_READY, NULL);
@@ -601,7 +517,7 @@ static int scp_A_ready_ipi_handler(unsigned int id, void *prdata, void *data,
 	/*verify scp image size*/
 	if (scp_image_size != SCP_A_TCM_SIZE) {
 		pr_err("[SCP]image size ERROR! AP=0x%x,SCP=0x%x\n",
-					SCP_A_TCM_SIZE, scp_image_size);
+				SCP_A_TCM_SIZE, scp_image_size);
 		WARN_ON(1);
 	}
 
@@ -684,6 +600,7 @@ int reset_scp(int reset)
 		/* write scp reserved memory address/size to GRP1/GRP2
 		 * to let scp setup MPU
 		 */
+		/* DBG: verify reset path and SCP core state */
 		writel((unsigned int)scp_mem_base_phys, DRAM_RESV_ADDR_REG);
 		writel((unsigned int)scp_mem_size, DRAM_RESV_SIZE_REG);
 		writel(1, R_CORE0_SW_RSTN_CLR);  /* release reset */
@@ -981,6 +898,14 @@ DEVICE_ATTR(recovery_flag, 0600, scp_recovery_flag_r, scp_recovery_flag_w);
 
 #endif
 
+
+/******************************************************************************
+ *****************************************************************************/
+/* A12 SCP protocol removed the IPI_OUT_SCP_LOG_FILTER_1 channel; the
+ * log filter sysfs knob is gone from the reference kernel as well.
+ */
+
+
 /******************************************************************************
  *****************************************************************************/
 static struct miscdevice scp_device = {
@@ -1088,10 +1013,6 @@ static int create_files(void)
 	if (unlikely(ret != 0))
 		return ret;
 #endif  // SCP_RECOVERY_SUPPORT
-
-	ret = device_create_file(scp_device.this_device, &dev_attr_log_filter);
-	if (unlikely(ret != 0))
-		return ret;
 
 	ret = device_create_file(scp_device.this_device
 					, &dev_attr_scpctl);
@@ -1244,7 +1165,7 @@ void scp_register_feature(enum feature_id id)
 	/* prevent from access when scp dvfs cali isn't done */
 	if (!scp_dvfs_cali_ready) {
 		pr_debug("[SCP] %s: dvfs cali not ready, scp_dvfs_cali=%u\n",
-		__func__, scp_dvfs_cali_ready);
+			__func__, scp_dvfs_cali_ready);
 		return;
 	}
 
@@ -1298,7 +1219,7 @@ void scp_deregister_feature(enum feature_id id)
 	/* prevent from access when scp dvfs cali isn't done */
 	if (!scp_dvfs_cali_ready) {
 		pr_debug("[SCP] %s: dvfs cali not ready, scp_dvfs_cali=%u\n",
-		__func__, scp_dvfs_cali_ready);
+			__func__, scp_dvfs_cali_ready);
 		return;
 	}
 
@@ -1491,11 +1412,8 @@ void scp_reset_wait_timeout(void)
 		mdelay(20);
 	}
 
-	if (timeout < 0) {
+	if (timeout == 0)
 		pr_notice("[SCP] reset timeout, still reset scp\n");
-		pr_notice("[SCP] core0_status = %x, core1_status = %x\n",
-		readl(R_CORE0_STATUS), readl(R_CORE1_STATUS));
-	}
 
 }
 
@@ -1652,6 +1570,7 @@ void scp_region_info_init(void)
 	pr_debug("[SCP] scp_region_info = %px\n", scp_region_info);
 	memcpy_from_scp(&scp_region_info_copy,
 		scp_region_info, sizeof(scp_region_info_copy));
+	/* DBG: verify SCP firmware actually ran (wrote region_info to SRAM) */
 }
 #else
 void scp_region_info_init(void) {}
@@ -1714,7 +1633,7 @@ static int scp_device_probe(struct platform_device *pdev)
 		return -1;
 	}
 	scpreg.total_tcmsize = (unsigned int)resource_size(res);
-	pr_debug("[SCP] sram base = 0x%px %x\n"
+	pr_info("[SCP] sram base = 0x%px %x\n"
 		, scpreg.sram, scpreg.total_tcmsize);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
@@ -1723,7 +1642,7 @@ static int scp_device_probe(struct platform_device *pdev)
 		pr_err("[SCP] scpreg.cfg error\n");
 		return -1;
 	}
-	pr_debug("[SCP] cfg base = 0x%px\n", scpreg.cfg);
+	pr_info("[SCP] cfg base = 0x%px\n", scpreg.cfg);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
 	scpreg.clkctrl = devm_ioremap_resource(dev, res);
@@ -1731,47 +1650,47 @@ static int scp_device_probe(struct platform_device *pdev)
 		pr_err("[SCP] scpreg.clkctrl error\n");
 		return -1;
 	}
-	pr_debug("[SCP] clkctrl base = 0x%px\n", scpreg.clkctrl);
+	pr_info("[SCP] clkctrl base = 0x%px\n", scpreg.clkctrl);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 3);
 	scpreg.cfg_core0 = devm_ioremap_resource(dev, res);
 	if (IS_ERR((void const *) scpreg.cfg_core0)) {
-		pr_debug("[SCP] scpreg.cfg_core0 error\n");
+		pr_err("[SCP] scpreg.cfg_core0 error\n");
 		return -1;
 	}
-	pr_debug("[SCP] cfg_core0 base = 0x%p\n", scpreg.cfg_core0);
+	pr_info("[SCP] cfg_core0 base = 0x%p\n", scpreg.cfg_core0);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 4);
 	scpreg.cfg_core1 = devm_ioremap_resource(dev, res);
 	if (IS_ERR((void const *) scpreg.cfg_core1)) {
-		pr_debug("[SCP] scpreg.cfg_core1 error\n");
+		pr_err("[SCP] scpreg.cfg_core1 error\n");
 		return -1;
 	}
-	pr_debug("[SCP] cfg_core1 base = 0x%p\n", scpreg.cfg_core1);
+	pr_info("[SCP] cfg_core1 base = 0x%p\n", scpreg.cfg_core1);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 5);
 	scpreg.bus_tracker = devm_ioremap_resource(dev, res);
 	if (IS_ERR((void const *) scpreg.bus_tracker)) {
-		pr_debug("[SCP] scpreg.bus_tracker error\n");
+		pr_err("[SCP] scpreg.bus_tracker error\n");
 		return -1;
 	}
-	pr_debug("[SCP] bus_tracker base = 0x%p\n", scpreg.bus_tracker);
+	pr_info("[SCP] bus_tracker base = 0x%p\n", scpreg.bus_tracker);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 6);
 	scpreg.l1cctrl = devm_ioremap_resource(dev, res);
 	if (IS_ERR((void const *) scpreg.l1cctrl)) {
-		pr_debug("[SCP] scpreg.l1cctrl error\n");
+		pr_err("[SCP] scpreg.l1cctrl error\n");
 		return -1;
 	}
-	pr_debug("[SCP] l1cctrl base = 0x%p\n", scpreg.l1cctrl);
+	pr_info("[SCP] l1cctrl base = 0x%p\n", scpreg.l1cctrl);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 7);
 	scpreg.cfg_sec = devm_ioremap_resource(dev, res);
 	if (IS_ERR((void const *) scpreg.cfg_sec)) {
-		pr_debug("[SCP] scpreg.cfg_sec error\n");
+		pr_err("[SCP] scpreg.cfg_sec error\n");
 		return -1;
 	}
-	pr_debug("[SCP] cfg_sec base = 0x%p\n", scpreg.cfg_sec);
+	pr_info("[SCP] cfg_sec base = 0x%p\n", scpreg.cfg_sec);
 
 
 	of_property_read_u32(pdev->dev.of_node, "scp_sramSize"
@@ -1780,7 +1699,7 @@ static int scp_device_probe(struct platform_device *pdev)
 		pr_err("[SCP] total_tcmsize not found\n");
 		return -ENODEV;
 	}
-	pr_debug("[SCP] scpreg.scp_tcmsize = %d\n", scpreg.scp_tcmsize);
+	pr_info("[SCP] scpreg.scp_tcmsize = %d\n", scpreg.scp_tcmsize);
 
 	/* scp core 0 */
 	if (of_property_read_string(pdev->dev.of_node, "core_0", &core_status))
@@ -1789,7 +1708,7 @@ static int scp_device_probe(struct platform_device *pdev)
 	if (strcmp(core_status, "enable") != 0)
 		pr_err("[SCP] core_0 not enable\n");
 	else {
-		pr_debug("[SCP] core_0 enable\n");
+		pr_info("[SCP] core_0 enable\n");
 		scp_enable[SCP_A_ID] = 1;
 	}
 
@@ -1800,7 +1719,7 @@ static int scp_device_probe(struct platform_device *pdev)
 		pr_err("[SCP]ipc0 require irq fail %d %d\n", scpreg.irq, ret);
 		//goto err;
 	}
-	pr_debug("ipc0 %d\n", scpreg.irq);
+	pr_info("ipc0 %d\n", scpreg.irq);
 	scpreg.irq = platform_get_irq_byname(pdev, "ipc1");
 	ret = request_irq(scpreg.irq, scp_A_irq_handler,
 		IRQF_TRIGGER_NONE, "SCP IPC1", NULL);
@@ -1808,12 +1727,20 @@ static int scp_device_probe(struct platform_device *pdev)
 		pr_err("[SCP]ipc1 require irq fail %d %d\n", scpreg.irq, ret);
 		//goto err;
 	}
-	pr_debug("ipc1 %d\n", scpreg.irq);
+	pr_info("ipc1 %d\n", scpreg.irq);
 	/* create mbox dev */
-	pr_debug("[SCP] mbox mbox probe\n");
+	pr_info("[SCP] mbox mbox probe\n");
 	for (i = 0; i < SCP_MBOX_TOTAL; i++) {
 		scp_mbox_info[i].mbdev = &scp_mboxdev;
-		mtk_mbox_probe(pdev, scp_mbox_info[i].mbdev, i);
+		ret = mtk_mbox_probe(pdev, scp_mbox_info[i].mbdev, i);
+		pr_err("[SCP-RES] mbox=%d probe_ret=%d irq=%d base=%p set=%p "
+			"clr=%p init=%p send=%p recv=%p\n", i, ret,
+			scp_mbox_info[i].irq_num, scp_mbox_info[i].base,
+			scp_mbox_info[i].set_irq_reg,
+			scp_mbox_info[i].clr_irq_reg,
+			scp_mbox_info[i].init_base_reg,
+			scp_mbox_info[i].send_status_reg,
+			scp_mbox_info[i].recv_status_reg);
 		mbox_setup_pin_table(i);
 	}
 
@@ -1911,40 +1838,6 @@ static struct syscore_ops scp_ipi_dbg_syscore_ops = {
 	.resume = scp_ipi_syscore_dbg_resume,
 };
 
-#ifdef OPLUS_FEATURE_SENSOR
-/* user-space event notify */
-static int scp_user_event_notify(struct notifier_block *nb,
-				  unsigned long event, void *ptr)
-{
-	struct device *dev = scp_device.this_device;
-	int ret = 0;
-
-	if (!dev)
-		return NOTIFY_DONE;
-
-	switch (event) {
-	case SCP_EVENT_STOP:
-		ret = kobject_uevent(&dev->kobj, KOBJ_OFFLINE);
-		break;
-	case SCP_EVENT_READY:
-		ret = kobject_uevent(&dev->kobj, KOBJ_ONLINE);
-		break;
-	default:
-		pr_info("%s, ignore event %lu", __func__, event);
-		break;
-	}
-
-	if (ret)
-		pr_info("%s, uevent(%lu) fail, ret %d", __func__, event, ret);
-
-	return NOTIFY_OK;
-}
-
-struct notifier_block scp_uevent_notifier = {
-	.notifier_call = scp_user_event_notify,
-};
-#endif /*OPLUS_FEATURE_SENSOR*/
-
 /*
  * driver initialization entry point
  */
@@ -1967,13 +1860,20 @@ static int __init scp_init(void)
 	}
 	scp_dvfs_cali_ready = 0;
 
-#if SCP_DVFS_INIT_ENABLE
+	#if SCP_DVFS_INIT_ENABLE
 	scp_dvfs_init();
 	wait_scp_dvfs_init_done();
 
 	/* pll maybe gate, request pll before access any scp reg/sram */
 	scp_pll_ctrl_set(PLL_ENABLE, CLK_26M);
-#endif
+	#endif
+
+	/* A12 starts SCP through ATF before platform registration. */
+	{
+		struct arm_smccc_res res;
+
+		arm_smccc_smc(0xc2000232, 1, 0, 0, 0, 0, 0, 0, &res);
+	}
 
 #ifndef CONFIG_FPGA_EARLY_PORTING
 	/* keep Univpll */
@@ -2012,19 +1912,16 @@ static int __init scp_init(void)
 
 	INIT_WORK(&scp_A_notify_work.work, scp_A_notify_ws);
 
-	scp_legacy_ipi_init();
+	ret = scp_legacy_ipi_init();
 
 	mtk_ipi_register(&scp_ipidev, IPI_IN_SCP_READY_0,
-			(void *)scp_A_ready_ipi_handler, NULL, &msg_scp_ready0);
-
+		(void *)scp_A_ready_ipi_handler, NULL, &msg_scp_ready0);
 	mtk_ipi_register(&scp_ipidev, IPI_IN_SCP_READY_1,
-			(void *)scp_A_ready_ipi_handler, NULL, &msg_scp_ready1);
-
+		(void *)scp_A_ready_ipi_handler, NULL, &msg_scp_ready1);
 	mtk_ipi_register(&scp_ipidev, IPI_IN_SCP_ERROR_INFO_0,
-			(void *)scp_err_info_handler, NULL, msg_scp_err_info0);
-
+		(void *)scp_err_info_handler, NULL, msg_scp_err_info0);
 	mtk_ipi_register(&scp_ipidev, IPI_IN_SCP_ERROR_INFO_1,
-			(void *)scp_err_info_handler, NULL, msg_scp_err_info1);
+		(void *)scp_err_info_handler, NULL, msg_scp_err_info1);
 
 	ret = register_pm_notifier(&scp_pm_notifier_block);
 	if (ret)
@@ -2072,6 +1969,10 @@ static int __init scp_init(void)
 
 #if SCP_DVFS_INIT_ENABLE
 	/* remember to release pll */
+	/* SCP regs must be read BEFORE the 26M PLL is disabled: after
+	 * PLL_DISABLE the SCP cfg bus has no clock and readl() stalls
+	 * the AP bus indefinitely. reset_scp() re-enables the PLL first.
+	 */
 	scp_pll_ctrl_set(PLL_DISABLE, CLK_26M);
 #endif
 
@@ -2085,10 +1986,6 @@ static int __init scp_init(void)
 	if (scp_dvfs_flag != 1)
 		scp_vcore_request(CLK_OPP0);
 #endif
-
-#ifdef OPLUS_FEATURE_SENSOR
-        scp_A_register_notify(&scp_uevent_notifier);
-#endif /*OPLUS_FEATURE_SENSOR*/
 
 	return ret;
 err:

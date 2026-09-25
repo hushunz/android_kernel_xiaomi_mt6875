@@ -19,12 +19,21 @@
 /*scp feature list*/
 struct scp_feature_tb feature_table[NUM_FEATURE_ID] = {
 /* VFFP:20 + default:5 */
+#ifdef CONFIG_MTK_VOW_DUAL_MIC_SUPPORT
+	{
+		.feature	= VOW_FEATURE_ID,
+		.freq		= 25,
+		.enable		= 0,
+		.sys_id		= SCPSYS_CORE1,
+	},
+#else
 	{
 		.feature	= VOW_FEATURE_ID,
 		.freq		= 5,
 		.enable		= 0,
 		.sys_id		= SCPSYS_CORE1,
 	},
+#endif
 	{
 		.feature	= SENS_FEATURE_ID,
 		.freq		= 29,
@@ -53,14 +62,22 @@ struct scp_feature_tb feature_table[NUM_FEATURE_ID] = {
 		.feature	= VCORE_TEST_FEATURE_ID,
 		.freq		= 77,
 		.enable		= 0,
-		.sys_id		= SCPSYS_CORE0,
 	},
+#ifdef CONFIG_MTK_VOW_DUAL_MIC_SUPPORT
+	{
+		.feature	= VOW_BARGEIN_FEATURE_ID,
+		.freq		= 200,
+		.enable		= 0,
+		.sys_id		= SCPSYS_CORE1,
+	},
+#else
 	{
 		.feature        = VOW_BARGEIN_FEATURE_ID,
-		.freq           = 135,
+		.freq           = 200,
 		.enable         = 0,
 		.sys_id         = SCPSYS_CORE1,
 	},
+#endif
 	{
 		.feature	= VOW_DUMP_FEATURE_ID,
 		.freq		= 10,
@@ -80,36 +97,19 @@ struct scp_feature_tb feature_table[NUM_FEATURE_ID] = {
 		.sys_id         = SCPSYS_CORE1,
 	},
 	{
-		.feature        = VOW_VENDOR_SPEECH_FEATURE_ID,
+		.feature        = VOW_VENDOR_G_FEATURE_ID,
 		.freq           = 22,
 		.enable         = 0,
 		.sys_id         = SCPSYS_CORE1,
 	},
-	{
-		.feature        = VOW_VENDOR_G_FEATURE_ID,
-		.freq           = 20,
-		.enable         = 0,
-		.sys_id         = SCPSYS_CORE1,
-	},
-	{
-		.feature        = VOW_DUAL_MIC_FEATURE_ID,
-		.freq           = 100,
-		.enable         = 0,
-		.sys_id         = SCPSYS_CORE1,
-	},
-	{
-		.feature        = VOW_DUAL_MIC_BARGE_IN_FEATURE_ID,
-		.freq           = 0,
-		.enable         = 0,
-		.sys_id         = SCPSYS_CORE0,
-	},
-	/* A12 官方内核: ULTRA 项无条件常驻且初始 enable=1 */
+#ifdef CONFIG_MTK_ULTRASND_PROXIMITY
 	{
 		.feature        = ULTRA_FEATURE_ID,
 		.freq           = 200,
-		.enable         = 1,
+		.enable         = 0,
 		.sys_id         = SCPSYS_CORE0,
 	},
+#endif
 };
 
 /*scp sensor type list*/

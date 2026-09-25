@@ -34,20 +34,27 @@ jobs:
         # 与官核完全一致的 Clang 版本
         # 官核: Android (6443078 based on r383902) clang version 11.0.1
         # Git commit: b397f81060ce6d701042b782172ed13bee898b79
-        # 从 AOSP 官方下载 clang-r383902
+        # 工具链来源改为 GitHub 镜像（原: android.googlesource.com）
+        #   clang-r383902 <- crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-6443078
+        #                    (分支 10.0, AndroidVersion.txt: 11.0.1 / based on r383902)
+        #   gcc 4.9       <- LineageOS 的 AOSP prebuilts gcc 4.9 镜像
+        # GitHub archive 顶层多一层 "<repo>-<branch>/", 用 --strip-components=1 去掉
         mkdir -p $GITHUB_WORKSPACE/clang-aosp/google_clang
         cd $GITHUB_WORKSPACE/clang-aosp/google_clang
-        wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/android-11.0.0_r48/clang-r383902.tar.gz
-        mkdir -p clang-r383902 && tar xzf clang-r383902.tar.gz -C clang-r383902
+        wget -nv --tries=3 --timeout=60 https://github.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-6443078/archive/refs/heads/10.0.tar.gz -O clang-r383902.tar.gz
+        mkdir -p clang-r383902 && tar xzf clang-r383902.tar.gz -C clang-r383902 --strip-components=1
         rm -f clang-r383902.tar.gz
         # 下载 GCC 工具链
         cd $GITHUB_WORKSPACE/clang-aosp
-        wget https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/android-11.0.0_r48.tar.gz -O gcc-aarch64.tar.gz
-        mkdir -p google_gcc/aarch64-linux-android-4.9 && tar xzf gcc-aarch64.tar.gz -C google_gcc/aarch64-linux-android-4.9
+        wget -nv --tries=3 --timeout=60 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9/archive/refs/heads/lineage-19.1.tar.gz -O gcc-aarch64.tar.gz
+        mkdir -p google_gcc/aarch64-linux-android-4.9 && tar xzf gcc-aarch64.tar.gz -C google_gcc/aarch64-linux-android-4.9 --strip-components=1
         rm -f gcc-aarch64.tar.gz
-        wget https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/android-11.0.0_r48.tar.gz -O gcc-arm.tar.gz
-        mkdir -p google_gcc/arm-linux-androideabi-4.9 && tar xzf gcc-arm.tar.gz -C google_gcc/arm-linux-androideabi-4.9
+        wget -nv --tries=3 --timeout=60 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9/archive/refs/heads/lineage-19.1.tar.gz -O gcc-arm.tar.gz
+        mkdir -p google_gcc/arm-linux-androideabi-4.9 && tar xzf gcc-arm.tar.gz -C google_gcc/arm-linux-androideabi-4.9 --strip-components=1
         rm -f gcc-arm.tar.gz
+        # 打印工具链版本, 便于在日志中核对
+        $GITHUB_WORKSPACE/clang-aosp/google_clang/clang-r383902/bin/clang --version | head -2
+        $GITHUB_WORKSPACE/clang-aosp/google_gcc/aarch64-linux-android-4.9/bin/aarch64-linux-android-gcc --version | head -1
 
     - name: Setup ccache
       uses: hendrikmuhs/ccache-action@v1.2

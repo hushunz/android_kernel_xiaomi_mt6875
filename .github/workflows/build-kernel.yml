@@ -17,6 +17,13 @@ on:
           - bomb
         default: cezanne
 
+# 同一个分支 + 同一个 defconfig/KSU 组合只保留最后一次构建:
+# 新 push 会自动取消还没跑完或还在排队的旧构建,
+# 避免一个 commit 上堆好几个 28 分钟的 run 互相抢 runner.
+concurrency:
+  group: build-kernel-${{ github.ref }}-${{ github.event.inputs.kernel_config || 'cezanne' }}-${{ github.event.inputs.enable_ksu || 'true' }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build Kernel

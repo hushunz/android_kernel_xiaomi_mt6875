@@ -36,18 +36,22 @@ struct ccu_device_s {
 	unsigned long camsys_base;
 	unsigned long bin_base;
 	unsigned long dmem_base;
-	unsigned long n3d_a_base;
-	unsigned int irq_num;
-	struct mutex user_mutex;
+	unsigned long pmem_base;	/* 官核 @0x38: IMEM, da_to_va 使用 */
+	unsigned long ddrmem_base;	/* 官核 @0x40 */
+	unsigned int irq_num;		/* 官核 @0x48 */
+	struct mutex user_mutex;	/* 官核 @0x50 (ioctl 互斥) */
 	struct mutex clk_mutex;
 	struct mutex ion_client_mutex;
-	u8 *i2c_dma_vaddr;
-	dma_addr_t i2c_dma_paddr;
-	uint32_t i2c_dma_mva;
 	/* list of vlist_type(ccu_user_t) */
 	struct list_head user_list;
 	/* notify enque thread */
 	wait_queue_head_t cmd_wait;
+	/* A11 保留项(官核无)：置于末尾, 以免破坏以上官核偏移 */
+	struct mutex user_list_mutex;	/* user_list 保护, 避免与 user_mutex 重入 */
+	unsigned long n3d_a_base;
+	u8 *i2c_dma_vaddr;
+	dma_addr_t i2c_dma_paddr;
+	uint32_t i2c_dma_mva;
 };
 
 struct ccu_user_s {
@@ -156,7 +160,7 @@ int ccu_force_powerdown(void);
 /**
  * ccu_run - start running ccu .
  */
-int ccu_run(void);
+int ccu_run(struct ccu_run_s *info);
 
 /**
  * ccu_irq - interrupt wait.
@@ -171,6 +175,17 @@ int ccu_AFwaitirq(struct CCU_WAIT_IRQ_STRUCT *WaitIrq, int sensoridx);
  */
 int ccu_flushLog(int argc, int *argv);
 
+/* 官核: ccu_load_bin/da_to_va/print_reg/print_sram_log */
+struct firmware;
+int ccu_load_bin(struct ccu_device_s *device, enum CCU_BIN_TYPE type);
+int ccu_sanity_check(const struct firmware *fw);
+int ccu_load_segments(const struct firmware *fw, enum CCU_BIN_TYPE type);
+int ccu_sw_hw_reset(void);
+void *ccu_da_to_va(u64 da, int len);
+void ccu_print_reg(uint32_t *Reg);
+void ccu_print_sram_log(char *sram_log);
+void ccu_ipc_init(unsigned int *ccuDmBase, unsigned int *ccuCtrlBase);
+
 
 
 int ccu_memcpy(void *dest, void *src, int length);
@@ -178,6 +193,9 @@ int ccu_memcpy(void *dest, void *src, int length);
 int ccu_memclr(void *dest, int length);
 
 int ccu_read_info_reg(int regNo);
+void ccu_write_info_reg(int regNo, int val);
+int ccu_read_struct_size(uint32_t *structSizes, uint32_t structCnt);
+int ccu_config_m4u_port(void);
 
 int ccu_query_power_status(void);
 

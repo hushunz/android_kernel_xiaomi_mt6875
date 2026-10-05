@@ -204,9 +204,10 @@ static struct ion_handle *_ccu_ion_alloc(struct ion_client *client,
  *   第一次 ion_kernel_ioctl(ION_CMD_MULTIMEDIA):
  *     mm_cmd = 8 (= ION_MM_GET_IOVA)
  *     kernel_handle = handle, security = 0, coherent = 1
- *     cached=0: module_id = 0x2c0 = M4U_PORT_L22_CCU0
+ *     cached=0: module_id = 0x2c0 (官核的 larb 编码) -> mt6885 走 m4u
+ *               路径, 必须用 m4u port 枚举 M4U_PORT_CCU0 (0xa1)
  *               reserve_iova = 0x40000000 / 0x43ffffff
- *     cached=1: module_id = 0x2e0 = M4U_PORT_L23_CCU1
+ *     cached=1: module_id = 0x2e0 (官核的 larb 编码) -> M4U_PORT_CCU1 (0xa2)
  *               reserve_iova = 0x44000000 / 0x47ffffff
  *     成功后 *mva = mm_data.get_phys_param.phy_addr
  *   第二次 ion_kernel_ioctl: mm_cmd = 1 (= ION_MM_SET_DEBUG_INFO),
@@ -227,13 +228,13 @@ static int _ccu_ion_get_mva(struct ion_client *client,
 	mm_data.config_buffer_param.security    = 0;
 	mm_data.config_buffer_param.coherent    = 1;
 	if (cached == false) {
-		mm_data.config_buffer_param.module_id = M4U_PORT_L22_CCU0;
+		mm_data.config_buffer_param.module_id = M4U_PORT_CCU0;
 		mm_data.config_buffer_param.reserve_iova_start =
 		CCU_DDR_BUF_MVA_LOWER_BOUND;
 		mm_data.config_buffer_param.reserve_iova_end =
 		CCU_DDR_BUF_MVA_UPPER_BOUND;
 	} else {
-		mm_data.config_buffer_param.module_id   = M4U_PORT_L23_CCU1;
+		mm_data.config_buffer_param.module_id   = M4U_PORT_CCU1;
 		mm_data.config_buffer_param.reserve_iova_start =
 		CCU_CTRL_BUFS_LOWER_BOUND;
 		mm_data.config_buffer_param.reserve_iova_end =

@@ -200,15 +200,39 @@ static struct ion_handle *_ccu_ion_alloc(struct ion_client *client,
 }
 
 /*
- * 官核 _ccu_ion_get_mva (0xffffff8008ca77f4) 逐步对应:
+ * A12 官核 (cezanne, 4.14.186-perf) _ccu_ion_get_mva @ 0xffffff8008c30ea0
+ * 反汇编实测:
+ *     tst  w3, #0x1
+ *     mov  w9,  #0x2e0          // 736
+ *     mov  w10, #0x2c0          // 704
+ *     csel w9, w10, w9, ne      // cached ? 0x2e0 : 0x2c0  = module_id
+ *     mov  w8,  #0x8
+ *     str  w8,  [sp, #8]        // mm_data.mm_cmd = 8 = ION_MM_GET_IOVA
+ *     str  w9,  [sp, #24]       // mm_data.module_id
+ *     stp  w11, w10, [sp, #36]  // reserve_iova_start/end
+ *     bl   ion_kernel_ioctl
+ *   (紧接第二次 ioctl: mm_cmd = 1 = ION_MM_SET_DEBUG_INFO, dbg_name 内联为
+ *    "CCU_BUFFER", value1..3 = 0x43/0x61/0x6d)
+ *
+ * 0x2c0 / 0x2e0 是 larb 编码, 满足 MTK_M4U_ID(larb, port) = (larb << 5) | port:
+ *     larb 22 = CCU_PSEUDO_LARBID_DISP -> 0x2c0
+ *     larb 23 = CCU_PSEUDO_LARBID_MDP  -> 0x2e0
+ * 即 mt6885-larb-port.h 里的 M4U_PORT_L22_CCU_DISP / M4U_PORT_L23_CCU_MDP。
+ * 这里直接给数值, 因为 mt6885 编译分支走的是 m4u.h, 不会包含 larb-port 头。
+ *
+ * 注意: 不能换成 m4u 的端口枚举 M4U_PORT_CCU0/M4U_PORT_CCU1 (0xa1/0xa2) ——
+ * ION_MM_GET_IOVA 这条路径用的是 iommu 的 larb 编码, 两套编号不通用。
+ */
+#define CCU_M4U_PORT_DDR_BUF	(22 << 5)	/* 0x2c0 */
+#define CCU_M4U_PORT_CTRL_BUF	(23 << 5)	/* 0x2e0 */
+
+/*
+ * 官核 _ccu_ion_get_mva (0xffffff8008c30ea0) 逐步对应:
  *   第一次 ion_kernel_ioctl(ION_CMD_MULTIMEDIA):
  *     mm_cmd = 8 (= ION_MM_GET_IOVA)
  *     kernel_handle = handle, security = 0, coherent = 1
- *     cached=0: module_id = 0x2c0 (官核的 larb 编码) -> mt6885 走 m4u
- *               路径, 必须用 m4u port 枚举 M4U_PORT_CCU0 (0xa1)
- *               reserve_iova = 0x40000000 / 0x43ffffff
- *     cached=1: module_id = 0x2e0 (官核的 larb 编码) -> M4U_PORT_CCU1 (0xa2)
- *               reserve_iova = 0x44000000 / 0x47ffffff
+ *     cached=0: module_id = 0x2c0, reserve_iova = 0x40000000 / 0x43ffffff
+ *     cached=1: module_id = 0x2e0, reserve_iova = 0x44000000 / 0x47ffffff
  *     成功后 *mva = mm_data.get_phys_param.phy_addr
  *   第二次 ion_kernel_ioctl: mm_cmd = 1 (= ION_MM_SET_DEBUG_INFO),
  *     dbg_name = "CCU_BUFFER", value1 = 67(0x43), value2 = 97(0x61),
@@ -228,13 +252,13 @@ static int _ccu_ion_get_mva(struct ion_client *client,
 	mm_data.config_buffer_param.security    = 0;
 	mm_data.config_buffer_param.coherent    = 1;
 	if (cached == false) {
-		mm_data.config_buffer_param.module_id = M4U_PORT_CCU0;
+		mm_data.config_buffer_param.module_id = CCU_M4U_PORT_DDR_BUF;
 		mm_data.config_buffer_param.reserve_iova_start =
 		CCU_DDR_BUF_MVA_LOWER_BOUND;
 		mm_data.config_buffer_param.reserve_iova_end =
 		CCU_DDR_BUF_MVA_UPPER_BOUND;
 	} else {
-		mm_data.config_buffer_param.module_id   = M4U_PORT_CCU1;
+		mm_data.config_buffer_param.module_id   = CCU_M4U_PORT_CTRL_BUF;
 		mm_data.config_buffer_param.reserve_iova_start =
 		CCU_CTRL_BUFS_LOWER_BOUND;
 		mm_data.config_buffer_param.reserve_iova_end =

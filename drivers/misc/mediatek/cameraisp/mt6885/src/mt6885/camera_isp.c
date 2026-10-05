@@ -5008,6 +5008,7 @@ static long ISP_ioctl(struct file *pFile, unsigned int Cmd, unsigned long Param)
 		}
 	} break;
 #ifdef ENABLE_KEEP_ION_HANDLE
+	case ISP_ION_IMPORT_A12: /* A12 firmware compat: fall through */
 	case ISP_ION_IMPORT:
 		if (copy_from_user(&IonNode, (void *)Param,
 				   sizeof(struct ISP_DEV_ION_NODE_STRUCT)) ==
@@ -5135,6 +5136,7 @@ static long ISP_ioctl(struct file *pFile, unsigned int Cmd, unsigned long Param)
 			Ret = -EFAULT;
 		}
 		break;
+	case ISP_ION_FREE_A12: /* A12 firmware compat: fall through */
 	case ISP_ION_FREE:
 		if (copy_from_user(&IonNode, (void *)Param,
 				   sizeof(struct ISP_DEV_ION_NODE_STRUCT)) ==
@@ -5543,7 +5545,8 @@ static long ISP_ioctl(struct file *pFile, unsigned int Cmd, unsigned long Param)
 			Ret = -EFAULT;
 		}
 		break;
-	case ISP_SET_VIR_CQCNT: {
+	case ISP_SET_VIR_CQCNT:
+	case ISP_SET_VIR_CQCNT_A12: /* A12 firmware compat: same handler */ {
 		unsigned int _cq_cnt[2] = {0};
 
 		if (copy_from_user(&_cq_cnt, (void *)Param,
@@ -5876,7 +5879,9 @@ static long ISP_ioctl_compat(struct file *filp, unsigned int cmd,
 	case ISP_FLUSH_IRQ_REQUEST:
 	case ISP_GET_VSYNC_CNT:
 	case ISP_RESET_VSYNC_CNT:
+	case ISP_ION_IMPORT_A12: /* A12 firmware compat */
 	case ISP_ION_IMPORT:
+	case ISP_ION_FREE_A12: /* A12 firmware compat */
 	case ISP_ION_FREE:
 	case ISP_ION_FREE_BY_HWMODULE:
 	case ISP_CQ_SW_PATCH:
@@ -5897,6 +5902,7 @@ static long ISP_ioctl_compat(struct file *filp, unsigned int cmd,
 	case ISP_NOTE_CQTHR0_BASE:
 	case ISP_GET_CUR_HWP1DONE:
 	case ISP_SET_VIR_CQCNT:
+	case ISP_SET_VIR_CQCNT_A12: /* A12 firmware compat */
 		return filp->f_op->unlocked_ioctl(filp, cmd, arg);
 	default:
 		return -ENOIOCTLCMD;
